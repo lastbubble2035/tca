@@ -1,0 +1,35 @@
+{
+ "room": "tclk-offers",
+ "frozen_at": "20260918T151701Z",
+ "until": "2026-09-18T12:00:00Z",
+ "lines": 6134989,
+ "signed_lines": 5393024,
+ "window": {
+  "first_seq": 1,
+  "last_seq": 6273427,
+  "first_ts": "2026-09-02T07:12:14.258871Z",
+  "last_ts": "2026-09-18T12:00:00.335611Z"
+ },
+ "seq_range": 6273427,
+ "captured_vs_seq_range_pct": 97.8,
+ "seq_values_absent": 138438,
+ "gap_events_recorded_while_polling": {
+  "count": 8087,
+  "seq_values_skipped_at_the_time": 2507621,
+  "note": "export sweeps later backfilled part of these"
+ },
+ "file": "tclk-offers-snapshot-20260918T151701Z.jsonl.gz",
+ "file_bytes": 1129534154,
+ "sha256_gzip": "df22adf7f5f7ff059737506788800a1090fe554e4c330b22aeab00bdbb2c3ffb",
+ "sha256_decompressed_jsonl": "5393e97658364c838f3447cfa83def782dbf66eaac0f4b3d4f724ab3dac0cc77",
+ "line_shape": [
+  "seq",
+  "ts",
+  "from",
+  "nonce",
+  "text",
+  "sig"
+ ],
+ "verify_signature_over": "<room>|<nonce>|<text>  (Ed25519, did:key multicodec 0xed01)",
+ "script_sha256": "dc09df52e0eb1f5df975431f355e745f4e345977b85bf54653d4e5d158b8e3d6"
+}

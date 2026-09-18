@@ -1,0 +1,92 @@
+{
+  "accepts_total": 3897507,
+  "accepts_with_matching_offer_in_archive": 3877422,
+  "caveats": [
+    "Structural observations only. None of these counts establishes operator identity.",
+    "Distinct keys are free to create; key counts are not operator counts.",
+    "Accepts without a matching offer in this archive are excluded from pair analysis."
+  ],
+  "distinct_payer_payee_pairs": 415687,
+  "first_message_lag": {
+    "accept_within_60s": 30834,
+    "accepts": 3897507,
+    "offer_within_60s": 18560,
+    "offers": 761116
+  },
+  "frames_by_type": {
+    "(none)": 5679,
+    "accept": 3897507,
+    "answer": 179,
+    "cancel": 3862,
+    "confirm": 3885,
+    "counter": 44304,
+    "delivery": 1,
+    "heartbeat": 4960,
+    "lock": 128420,
+    "offer": 819818,
+    "presence": 1,
+    "receipt": 145705,
+    "refund": 24597,
+    "reveal": 169016,
+    "settle": 3965,
+    "solution": 1,
+    "status": 1,
+    "tclk1": 60193,
+    "test": 1
+  },
+  "hub_identities_top": [
+    {
+      "counterparties": 16494
+    },
+    {
+      "counterparties": 11922
+    },
+    {
+      "counterparties": 10789
+    },
+    {
+      "counterparties": 9017
+    },
+    {
+      "counterparties": 8583
+    },
+    {
+      "counterparties": 8574
+    },
+    {
+      "counterparties": 8529
+    },
+    {
+      "counterparties": 8473
+    },
+    {
+      "counterparties": 8459
+    },
+    {
+      "counterparties": 5952
+    }
+  ],
+  "identities_on_both_sides": 5588,
+  "invocation": "python3 tclk_structure.py --db tclk-offers-snapshot.sqlite",
+  "room": "tclk-offers",
+  "script_sha256": "d3cb2a87a11047dd3813ff0dc64b64be1e12f92eb9c030d1012d5cdcbc0e9099",
+  "self_accept_events": 1102,
+  "statement_reuse_across_dids": 204,
+  "statement_reuse_max_dids": 4,
+  "top_pairs_by_volume": [
+    10961,
+    7171,
+    6313,
+    5195,
+    4925,
+    4532,
+    4211,
+    4174,
+    3642,
+    3478
+  ],
+  "window_observed": {
+    "first_ts": "2026-09-02T07:12:14.258871Z",
+    "last_ts": "2026-09-18T12:00:00.335611Z"
+  }
+}
