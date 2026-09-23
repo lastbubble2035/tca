@@ -1,0 +1,213 @@
+{
+ "script_sha256": "8053dc9922cecb7c73c30a8b72d6ab96626e9491172460953487492ac5d79f58",
+ "candidate_set": [
+  "vngalaxy3",
+  "dongqn-s2",
+  "abigayle"
+ ],
+ "compared_against": [
+  "maragung-flop",
+  "solvarn",
+  "pelmora",
+  "wickerlight",
+  "nathbabu"
+ ],
+ "window": {
+  "first_ts": "2026-09-18T08:30:12.868366Z",
+  "last_ts": "2026-09-18T14:00:00.951846Z",
+  "minutes": 209,
+  "ballots": 99743
+ },
+ "last_ballot_tally": {
+  "vngalaxy3": 1743,
+  "dongqn-s2": 1699,
+  "abigayle": 1634,
+  "maragung-flop": 15413,
+  "solvarn": 12816,
+  "pelmora": 7807,
+  "wickerlight": 176,
+  "nathbabu": 165
+ },
+ "active_minutes": {
+  "vngalaxy3": 202,
+  "dongqn-s2": 203,
+  "abigayle": 203,
+  "maragung-flop": 209,
+  "solvarn": 190,
+  "pelmora": 88,
+  "wickerlight": 42,
+  "nathbabu": 3
+ },
+ "minute_correlation": {
+  "vngalaxy3 ~ dongqn-s2": 0.999,
+  "vngalaxy3 ~ abigayle": 0.998,
+  "vngalaxy3 ~ maragung-flop": -0.236,
+  "vngalaxy3 ~ solvarn": 0.041,
+  "vngalaxy3 ~ pelmora": 0.379,
+  "vngalaxy3 ~ wickerlight": -0.034,
+  "vngalaxy3 ~ nathbabu": 0.133,
+  "dongqn-s2 ~ abigayle": 0.997,
+  "dongqn-s2 ~ maragung-flop": -0.233,
+  "dongqn-s2 ~ solvarn": 0.045,
+  "dongqn-s2 ~ pelmora": 0.377,
+  "dongqn-s2 ~ wickerlight": -0.041,
+  "dongqn-s2 ~ nathbabu": 0.13,
+  "abigayle ~ maragung-flop": -0.238,
+  "abigayle ~ solvarn": 0.039,
+  "abigayle ~ pelmora": 0.373,
+  "abigayle ~ wickerlight": -0.026,
+  "abigayle ~ nathbabu": 0.138,
+  "maragung-flop ~ solvarn": 0.088,
+  "maragung-flop ~ pelmora": 0.246,
+  "maragung-flop ~ wickerlight": 0.018,
+  "maragung-flop ~ nathbabu": -0.116,
+  "solvarn ~ pelmora": 0.269,
+  "solvarn ~ wickerlight": -0.054,
+  "solvarn ~ nathbabu": -0.072,
+  "pelmora ~ wickerlight": 0.027,
+  "pelmora ~ nathbabu": -0.015,
+  "wickerlight ~ nathbabu": 0.046
+ },
+ "rotation_in_candidate_set": {
+  "ballots_in_set": 59919,
+  "switch_rate": 0.678,
+  "switch_rate_if_independent": 0.667
+ },
+ "dids_voting_for_more_than_one_entry_in_set": 4773,
+ "ballot_request_id_stems_top3": {
+  "vngalaxy3": [
+   [
+    "rzxyz",
+    14549,
+    72.7
+   ],
+   [
+    "bzxyz",
+    4835,
+    24.2
+   ],
+   [
+    "bf",
+    199,
+    1.0
+   ]
+  ],
+  "dongqn-s2": [
+   [
+    "rzxyz",
+    14530,
+    72.9
+   ],
+   [
+    "bzxyz",
+    4882,
+    24.5
+   ],
+   [
+    "bf",
+    130,
+    0.7
+   ]
+  ],
+  "abigayle": [
+   [
+    "rzxyz",
+    14497,
+    72.5
+   ],
+   [
+    "bzxyz",
+    4913,
+    24.6
+   ],
+   [
+    "bf",
+    193,
+    1.0
+   ]
+  ],
+  "maragung-flop": [
+   [
+    "(other)",
+    8949,
+    54.2
+   ],
+   [
+    "sonnet",
+    2171,
+    13.2
+   ],
+   [
+    "f",
+    574,
+    3.5
+   ]
+  ],
+  "solvarn": [
+   [
+    "(other)",
+    3598,
+    27.9
+   ],
+   [
+    "c",
+    124,
+    1.0
+   ],
+   [
+    "t",
+    119,
+    0.9
+   ]
+  ],
+  "pelmora": [
+   [
+    "(other)",
+    2138,
+    27.1
+   ],
+   [
+    "l",
+    82,
+    1.0
+   ],
+   [
+    "c",
+    78,
+    1.0
+   ]
+  ],
+  "wickerlight": [
+   [
+    "ballot",
+    1071,
+    96.0
+   ],
+   [
+    "vote",
+    12,
+    1.1
+   ],
+   [
+    "(other)",
+    12,
+    1.1
+   ]
+  ],
+  "nathbabu": [
+   [
+    "nathbabu",
+    165,
+    100.0
+   ]
+  ]
+ },
+ "registration_request_id_stems_top3": {},
+ "registration_hour_top3": {},
+ "first_seen_in_archive": {},
+ "caveats": [
+  "The votes room is a ring. Only ballots inside the captured window are tested.",
+  "First seen means first message by that DID in this archive, which began 2026-08-28 and holds gaps. A DID can be older than its first captured message.",
+  "Correlation and rotation describe arrival patterns. Operator identity is outside the record."
+ ]
+}

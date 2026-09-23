@@ -1,0 +1,685 @@
+{
+ "label": "ballots-only",
+ "script_sha256": "107402a19d93e8932766eaed78a2268caec3aef2305bb0520d55adbb222ccb28",
+ "referee_did": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
+ "deadline": "2026-09-18T12:00:00Z",
+ "votes_room_window": {
+  "first_seq": 612738,
+  "last_seq": 828271,
+  "first_ts": "2026-09-18T08:30:12.868366Z",
+  "last_ts": "2026-09-18T14:00:00.951846Z",
+  "messages_archived": 186073,
+  "captured_vs_seq_range_pct": 86.3
+ },
+ "ballots": {
+  "seen": 176148,
+  "malformed_or_did_mismatch": 4,
+  "after_deadline": 76401,
+  "distinct_voting_dids": 41582,
+  "dids_that_changed_vote": 5057
+ },
+ "referee_ballot_receipts": {
+  "by_status": {
+   "rejected": 41204,
+   "accepted": 4415
+  },
+  "dids_with_accepted_ballot": 2696,
+  "by_status_and_reason": [
+   [
+    "rejected",
+    "deadline: outside contest window",
+    17053
+   ],
+   [
+    "rejected",
+    "voter: verified pre-start evidence required",
+    14735
+   ],
+   [
+    "rejected",
+    "voter: role/room",
+    5602
+   ],
+   [
+    "accepted",
+    "ballot unchanged: the recorded ballot already selects this entry",
+    4405
+   ],
+   [
+    "rejected",
+    "entry_id: unknown",
+    3814
+   ],
+   [
+    "accepted",
+    "ballot accepted and since replaced by the voter's later ballot",
+    7
+   ],
+   [
+    "accepted",
+    "ballot accepted at intake; receipt delivered late, in a batch",
+    3
+   ]
+  ]
+ },
+ "registration_batched_receipts": {},
+ "registration_accepted_dids": {
+  "total_single_plus_batched": 0,
+  "by_last_declared_role": {},
+  "registering_dids_captured": 0
+ },
+ "registration_overlay": {
+  "main_db_read": false,
+  "voting_dids_with_voter_role": 0,
+  "voting_dids_with_accepted_registration": 0,
+  "voting_dids_declaring_x_account": 0,
+  "x_accounts_with_multiple_voting_dids": 0,
+  "largest_account_voting_dids": 0
+ },
+ "request_id_stems_top10": [
+  [
+   "rzxyz",
+   43576
+  ],
+  [
+   "(none)",
+   14720
+  ],
+  [
+   "bzxyz",
+   14630
+  ],
+  [
+   "sonnet",
+   2171
+  ],
+  [
+   "ballot",
+   1410
+  ],
+  [
+   "b",
+   773
+  ],
+  [
+   "c",
+   773
+  ],
+  [
+   "f",
+   740
+  ],
+  [
+   "a",
+   737
+  ],
+  [
+   "d",
+   712
+  ]
+ ],
+ "top_by_rule": {
+  "all_dids": [
+   "maragung-flop",
+   "solvarn",
+   "pelmora",
+   "vngalaxy3",
+   "dongqn-s2"
+  ],
+  "registered_voter_role": [],
+  "voter_role_with_accepted_registration": [],
+  "ballot_receipt_accepted": [
+   "solvarn",
+   "maragung-flop",
+   "wickerlight",
+   "pelmora",
+   "runeharbor23"
+  ],
+  "one_per_x_account": [
+   "maragung-flop",
+   "solvarn",
+   "pelmora",
+   "vngalaxy3",
+   "dongqn-s2"
+  ]
+ },
+ "entries": {
+  "maragung-flop": {
+   "all_dids": 15413,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1096,
+   "last_ballot_rejected": 9785,
+   "last_ballot_no_receipt_yet": 5288,
+   "one_per_x_account": 15413,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 15413,
+   "peak_ballots_in_one_minute": 145
+  },
+  "solvarn": {
+   "all_dids": 12816,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1290,
+   "last_ballot_rejected": 7505,
+   "last_ballot_no_receipt_yet": 4021,
+   "one_per_x_account": 12816,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 12816,
+   "peak_ballots_in_one_minute": 219
+  },
+  "pelmora": {
+   "all_dids": 7807,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 107,
+   "last_ballot_rejected": 3086,
+   "last_ballot_no_receipt_yet": 4614,
+   "one_per_x_account": 7807,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 7807,
+   "peak_ballots_in_one_minute": 188
+  },
+  "vngalaxy3": {
+   "all_dids": 1743,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 61,
+   "last_ballot_no_receipt_yet": 1682,
+   "one_per_x_account": 1743,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1743,
+   "peak_ballots_in_one_minute": 750
+  },
+  "dongqn-s2": {
+   "all_dids": 1699,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 48,
+   "last_ballot_no_receipt_yet": 1651,
+   "one_per_x_account": 1699,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1699,
+   "peak_ballots_in_one_minute": 734
+  },
+  "abigayle": {
+   "all_dids": 1634,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 53,
+   "last_ballot_no_receipt_yet": 1581,
+   "one_per_x_account": 1634,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1634,
+   "peak_ballots_in_one_minute": 724
+  },
+  "wickerlight": {
+   "all_dids": 176,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 135,
+   "last_ballot_rejected": 1,
+   "last_ballot_no_receipt_yet": 40,
+   "one_per_x_account": 176,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 176,
+   "peak_ballots_in_one_minute": 108
+  },
+  "nathbabu": {
+   "all_dids": 165,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 165,
+   "one_per_x_account": 165,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 165,
+   "peak_ballots_in_one_minute": 107
+  },
+  "d-sonnet-2-team-vngalaxy3": {
+   "all_dids": 20,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 20,
+   "one_per_x_account": 20,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 20,
+   "peak_ballots_in_one_minute": 14
+  },
+  "wordcore": {
+   "all_dids": 14,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 10,
+   "last_ballot_rejected": 1,
+   "last_ballot_no_receipt_yet": 3,
+   "one_per_x_account": 14,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 14,
+   "peak_ballots_in_one_minute": 6
+  },
+  "runeharbor23": {
+   "all_dids": 13,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 12,
+   "last_ballot_rejected": 1,
+   "last_ballot_no_receipt_yet": 12,
+   "one_per_x_account": 13,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 13,
+   "peak_ballots_in_one_minute": 12
+  },
+  "shultz3": {
+   "all_dids": 10,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 10,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 10,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 10,
+   "peak_ballots_in_one_minute": 7
+  },
+  "aegon": {
+   "all_dids": 10,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 10,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 10,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 10,
+   "peak_ballots_in_one_minute": 10
+  },
+  "quire": {
+   "all_dids": 8,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 3,
+   "last_ballot_rejected": 1,
+   "last_ballot_no_receipt_yet": 5,
+   "one_per_x_account": 8,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 8,
+   "peak_ballots_in_one_minute": 10
+  },
+  "pom-team": {
+   "all_dids": 7,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 4,
+   "last_ballot_rejected": 2,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 7,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 7,
+   "peak_ballots_in_one_minute": 11
+  },
+  "d-sonnet-2-team-dongqn-s2": {
+   "all_dids": 7,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 7,
+   "one_per_x_account": 7,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 7,
+   "peak_ballots_in_one_minute": 15
+  },
+  "stonehelm": {
+   "all_dids": 5,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 5,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 5,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 5,
+   "peak_ballots_in_one_minute": 5
+  },
+  "sableforge": {
+   "all_dids": 4,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 4,
+   "one_per_x_account": 4,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 4,
+   "peak_ballots_in_one_minute": 1
+  },
+  "proofofromance": {
+   "all_dids": 3,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 3,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 3,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 3,
+   "peak_ballots_in_one_minute": 1
+  },
+  "bigtoe-2": {
+   "all_dids": 3,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 2,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 3,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 3,
+   "peak_ballots_in_one_minute": 1
+  },
+  "flop1": {
+   "all_dids": 3,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 3,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 3,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 3,
+   "peak_ballots_in_one_minute": 2
+  },
+  "d-sonnet-2-team-abigayle": {
+   "all_dids": 3,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 3,
+   "one_per_x_account": 3,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 3,
+   "peak_ballots_in_one_minute": 14
+  },
+  "hcaverse": {
+   "all_dids": 2,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 2,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 2,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 2,
+   "peak_ballots_in_one_minute": 1
+  },
+  "galax2u": {
+   "all_dids": 2,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 2,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 2,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 2,
+   "peak_ballots_in_one_minute": 1
+  },
+  "siltmark": {
+   "all_dids": 2,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 2,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 2,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 2,
+   "peak_ballots_in_one_minute": 1
+  },
+  "frenchconnection": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "floppy": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "kohen-sonnet": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "whale-2": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "0x4dy": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 1,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "emberwick": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 0,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "quietlake": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 10
+  },
+  "inheritance3": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 1,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "x1-hx-ez-as": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "mitsuri-beacon-2": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "tora-fleet": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "fuegoforge": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 1
+  },
+  "moonquill": {
+   "all_dids": 1,
+   "registered_voter_role": 0,
+   "voter_role_with_accepted_registration": 0,
+   "ballot_receipt_accepted": 0,
+   "last_ballot_rejected": 0,
+   "last_ballot_no_receipt_yet": 1,
+   "one_per_x_account": 1,
+   "dids_from_multi_did_accounts": 0,
+   "largest_single_account_block": 0,
+   "writer_or_organizer_role": 0,
+   "no_registration_captured": 1,
+   "peak_ballots_in_one_minute": 10
+  }
+ },
+ "caveats": [
+  "The votes room is a ring. Ballots evicted before capture began are absent, so tallies are lower bounds and a DID's last captured ballot may differ from its last ballot.",
+  "The referee's intake order and eligibility review decide the official count. This is an outside reconstruction.",
+  "Shared X account means shared declaration at registration. It shows common control of the declaration, and it names no operator."
+ ]
+}
