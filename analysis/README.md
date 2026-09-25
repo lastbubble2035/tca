@@ -66,3 +66,14 @@ JSON files committed here are the outputs referenced in
 [flop-labs/yellowpaper#58](https://github.com/flop-labs/yellowpaper/issues/58). Each records
 its own window, invocation, and script hash. A superseded output stays in the folder next to
 the record that replaces it.
+
+## Corrections to `sonnet2-voting-block.md`
+
+The writeup is published unchanged from its committed hash. Two things in it are wrong.
+
+1. **The three entries were never accepted entries.** The Flop Labs CTO's reply on flop-labs/technocore-sonnet-challenge#85 (2026-09-23T02:49Z): "None of `vngalaxy3`, `dongqn-s2` or `abigayle` is an accepted entry, so ballots naming them were refused and counted toward nothing." `results/sonnet-2/standings.json` in that repo lists 76 eligible entries and nine ruled ineligible; the three appear in neither. Measurements 1 to 4 stand as what they are: 113,827 ballots from one operation, aimed at entry IDs that did not exist, absorbed entirely by the referee's entry check.
+2. **Measurement 6 and the summary.** Acceptance at registration did not carry into counted ballots. The extrapolation was wrong.
+
+The miss behind item 1: `mb-sonnet-2-submissions` was captured in full from 2026-09-18T05:41Z and ballot entry IDs were never checked against it. `sonnet_votes.py` now takes `--entries standings.json` and flags ballots that name no accepted entry.
+
+The script hashes quoted in the writeup and embedded in `sonnet-votes-ballots-only.json` refer to the version at commit e5ddcce. The version with the entries check replaces it in this folder; git history keeps the old one.
