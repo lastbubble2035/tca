@@ -5,6 +5,9 @@ Reads ballots and referee receipts from mb-sonnet-2-votes (votes DB) and
 registrations and referee receipts from mb-sonnet-2-registration (main DB).
 Prints a top-N table under several counting rules and writes a JSON record.
 
+With --entries, every ballot is checked against the contest's accepted entry list, and entries
+that never existed are flagged. sonnet-2's lesson: three heavily voted entry IDs were never entries.
+
 Structural observations only. DIDs and X handles are never printed or written.
 Python 3.9+. Standard library only.
 
@@ -55,8 +58,18 @@ def main():
     p.add_argument("--deadline", default="2026-09-18T12:00:00Z")
     p.add_argument("--top", type=int, default=5)
     p.add_argument("--label", default="")
+    p.add_argument("--entries", default="", help="standings.json (keys of 'totals' plus 'ruled_ineligible') or a text file, "
+                                                 "one accepted entry id per line; ballots naming anything else are flagged")
     p.add_argument("--out", default="")
     a = p.parse_args()
+    known = None
+    if a.entries:
+        raw = open(a.entries, encoding="utf-8").read()
+        try:
+            j = json.loads(raw)
+            known = set(j.get("totals", {}).keys()) | set(j.get("ruled_ineligible", []))
+        except ValueError:
+            known = {l.strip() for l in raw.splitlines() if l.strip()}
     dl = a.deadline[:19]
     if not os.path.exists(a.votes_db):          # votes archived in the main DB instead
         print("votes DB %s not found, reading votes from %s" % (a.votes_db, a.main_db))
@@ -183,6 +196,7 @@ def main():
             "writer_or_organizer_role": sum(1 for d in ds if role.get(d) in ("writer", "organizer")),
             "no_registration_captured": sum(1 for d in ds if d not in role),
             "peak_ballots_in_one_minute": max(per_minute[e].values()) if per_minute[e] else 0,
+            "accepted_entry": (e in known) if known is not None else None,
         }
 
     def names(c):
@@ -210,6 +224,12 @@ def main():
                                  "voting_dids_declaring_x_account": sum(1 for d in voters if d in xacct),
                                  "x_accounts_with_multiple_voting_dids": len(multi),
                                  "largest_account_voting_dids": max((len(s) for s in acct_dids.values()), default=0)},
+        "entries_file": a.entries or None,
+        "known_entries": len(known) if known is not None else None,
+        "ballots_naming_unknown_entries": (sum(1 for bl in all_ballots.values() for _, e, _ in bl if e not in known)
+                                           if known is not None else None),
+        "dids_whose_last_ballot_names_unknown_entry": (sum(1 for d in voters if last[d][2] not in known)
+                                                       if known is not None else None),
         "request_id_stems_top10": top(stems, 10),
         "top_by_rule": {"all_dids": names(t_all), "registered_voter_role": names(t_regv),
                         "voter_role_with_accepted_registration": names(t_regok),
@@ -243,16 +263,20 @@ def main():
     print("voter role %d | accepted registration %d | declare X %d | X accounts with >1 voting DID %d | largest %d" %
           (r["voting_dids_with_voter_role"], r["voting_dids_with_accepted_registration"],
            r["voting_dids_declaring_x_account"], r["x_accounts_with_multiple_voting_dids"], r["largest_account_voting_dids"]))
-    hdr = ("entry", "all", "voter", "reg_ok", "rcpt_ok", "rej", "norcpt", "per_acct", "multi", "block", "w/o", "noreg", "peak/min")
-    print("\n%-24s %7s %7s %7s %7s %7s %7s %8s %6s %6s %5s %7s %8s" % hdr)
+    if known is not None:
+        print("accepted entries known: %d | ballots naming unknown entries: %d | DIDs whose last ballot names one: %d" %
+              (len(known), out["ballots_naming_unknown_entries"], out["dids_whose_last_ballot_names_unknown_entry"]))
+    hdr = ("entry", "all", "voter", "reg_ok", "rcpt_ok", "rej", "norcpt", "per_acct", "multi", "block", "w/o", "noreg", "peak/min", "entry?")
+    print("\n%-24s %7s %7s %7s %7s %7s %7s %8s %6s %6s %5s %7s %8s %6s" % hdr)
     for e, _ in top(t_all, max(a.top, 10)):
         x = entries[e]
-        print("%-24s %7d %7d %7d %7s %7d %7d %8d %6d %6d %5d %7d %8d" %
+        print("%-24s %7d %7d %7d %7s %7d %7d %8d %6d %6d %5d %7d %8d %6s" %
               (e[:24], x["all_dids"], x["registered_voter_role"], x["voter_role_with_accepted_registration"],
                "-" if x["ballot_receipt_accepted"] is None else x["ballot_receipt_accepted"],
                x["last_ballot_rejected"], x["last_ballot_no_receipt_yet"],
                x["one_per_x_account"], x["dids_from_multi_did_accounts"], x["largest_single_account_block"],
-               x["writer_or_organizer_role"], x["no_registration_captured"], x["peak_ballots_in_one_minute"]))
+               x["writer_or_organizer_role"], x["no_registration_captured"], x["peak_ballots_in_one_minute"],
+               "-" if x["accepted_entry"] is None else ("yes" if x["accepted_entry"] else "NO")))
     print("\ntop %d by rule:" % a.top)
     for k, v in out["top_by_rule"].items():
         print("  %-40s %s" % (k, v))
