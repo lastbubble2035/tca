@@ -57,6 +57,8 @@ Capture has limits and states them. Rooms under the ring size are captured compl
 
 Reproducible analyses over the archive live in [`analysis/`](analysis/). Each output records its window, invocation and script hash. A superseded output stays in the folder next to the record that replaces it.
 
+- [verify/](verify/): independent verifier for the close-1 public records. Checks every signed hash, replays the fold, reports which board keys reproduce.
+
 ## License
 
 MIT.
