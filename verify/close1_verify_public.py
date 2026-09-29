@@ -1,0 +1,1027 @@
+#!/usr/bin/env python3
+"""close1_verify_public.py: an independent, read-only check of the close-1 contest from public data.
+
+Stages (run them all with `all`):
+
+  fetch    GET https://challenges.technocore.chat/close-1/index.json and every record it lists into
+           verify/records/, sequentially and resumably (a file already present with the index's byte
+           size is skipped). Writes records/expected.sha256 (full: the posted "file"; redacted: the
+           index's own "sha256"), usable with `shasum -a 256 -c`.
+  venue    GET, once each and cached: the d-close1-pnl export, the d-close1-price export (for the
+           referee's signed seed post) and the room-owners notes of both rooms (the referee DID).
+  verify   Ed25519 signature of every referee post; index "file" == signed pnl post "file" per sweep;
+           sha256 of every record; redacted trades per sweep; builds the fold input in verify/cache/.
+  replay   Runs close-call/close_call_fold.py (imported by path, unmodified) over the cached input,
+           redacted trades skipped, and compares every sweep with the records and the signed boards.
+  report   Writes verify/REPORT.md and verify/sweeps.csv.
+
+Nothing here writes to the network: every request is an HTTP GET. Standard library only (the
+`cryptography` package, if installed, is used to cross-check the built-in Ed25519 verifier).
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import importlib.util
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+RECORDS = HERE / "records"
+VENUE_DIR = HERE / "venue"
+CACHE = HERE / "cache"
+PROGRESS = HERE / "progress.log"
+REPORT = HERE / "REPORT.md"
+SWEEPS_CSV = HERE / "sweeps.csv"
+DEFAULT_REPO = Path(os.environ.get("CLOSE_CALL_REPO", str(HERE.parent / "close-call")))
+
+ARCHIVE = "https://challenges.technocore.chat/close-1"
+VENUE = "https://technocore.chat"
+PNL_ROOM, PRICE_ROOM = "d-close1-pnl", "d-close1-price"
+UA = "close1-verify-public/1.0 (read-only)"
+MIN_INTERVAL = 0.5          # seconds between requests: at most ~2 reads/s, far under 600/min
+CENT = Decimal("0.01")
+PATH_RE = re.compile(r"(sweeps|redacted)/[0-9a-f]{64}\.json")
+HEX64 = re.compile(r"[0-9a-f]{64}")
+DID_RE = re.compile(r"did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}")
+
+
+# ---------------------------------------------------------------- small utilities
+
+def utc(ts: float | None = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if ts is None else ts))
+
+
+def log(msg: str, echo: bool = True) -> None:
+    PROGRESS.parent.mkdir(parents=True, exist_ok=True)
+    line = f"{utc()} {msg}"
+    with open(PROGRESS, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+    if echo:
+        print(line, flush=True)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def dump_json(path: Path, obj) -> None:
+    write_atomic(path, (json.dumps(obj, indent=1, sort_keys=True) + "\n").encode())
+
+
+# ---------------------------------------------------------------- HTTP (GET only)
+
+class Getter:
+    """Sequential GETs, paced to MIN_INTERVAL, retrying 408/429/5xx and network errors with capped,
+    jittered backoff (honouring a Retry-After header or a seconds figure in a 429 body)."""
+
+    def __init__(self, tries: int = 8):
+        self.tries, self.last = tries, 0.0
+        self.requests = 0
+        self.bytes = 0
+
+    def _pace(self) -> None:
+        wait = self.last + MIN_INTERVAL - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+        self.last = time.monotonic()
+
+    def get(self, url: str, dest: Path | None = None, timeout: float = 180) -> tuple[int, bytes, dict]:
+        """(status, body, headers); with `dest`, the body is streamed to dest + '.part' and renamed on
+        success, and the returned body is empty."""
+        status, body, headers = 0, b"", {}
+        for attempt in range(self.tries):
+            self._pace()
+            self.requests += 1
+            req = urllib.request.Request(url, method="GET", headers={"User-Agent": UA})
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    status, headers = r.status, dict(r.headers)
+                    if dest is None:
+                        body = r.read()
+                        self.bytes += len(body)
+                        return status, body, headers
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dest.with_name(dest.name + ".part")
+                    n = 0
+                    with open(tmp, "wb") as f:
+                        for chunk in iter(lambda: r.read(1 << 20), b""):
+                            f.write(chunk)
+                            n += len(chunk)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self.bytes += n
+                    os.replace(tmp, dest)
+                    return status, b"", headers
+            except urllib.error.HTTPError as e:
+                status, headers = e.code, dict(e.headers or {})
+                body = e.read() or b""
+            except Exception as e:      # timeouts, resets, DNS, truncated bodies
+                status, body, headers = 0, f"{type(e).__name__}: {e}".encode(), {}
+            if status in (0, 408, 429) or status >= 500:
+                delay = self._retry_after(headers, body) if status == 429 else None
+                delay = delay if delay is not None else min(120.0, 2.0 ** attempt) * (0.5 + random.random())
+                log(f"GET {url} -> {status or 'network error'}; retry {attempt + 1}/{self.tries} in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            return status, body, headers
+        return status, body, headers
+
+    @staticmethod
+    def _retry_after(headers: dict, body: bytes) -> float | None:
+        for text in (headers.get("Retry-After"), body.decode(errors="replace")[:500]):
+            if text:
+                m = re.search(r"(\d+(?:\.\d+)?)\s*(?:s\b|sec|seconds?)", str(text)) or \
+                    re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", str(text))
+                if m:
+                    return min(float(m.group(1)), 300.0)
+        return None
+
+
+# ---------------------------------------------------------------- Ed25519 (RFC 8032), verify only
+
+_P = 2 ** 255 - 19
+_L = 2 ** 252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_I = pow(2, (_P - 1) // 4, _P)
+
+
+def _recover_x(y: int, sign: int) -> int | None:
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * pow(_D * y * y + 1, _P - 2, _P) % _P
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P:
+        x = x * _I % _P
+    if (x * x - x2) % _P:
+        return None
+    return _P - x if (x & 1) != sign else x
+
+
+_GY = 4 * pow(5, _P - 2, _P) % _P
+_GX = _recover_x(_GY, 0)
+_G = (_GX, _GY, 1, _GX * _GY % _P)
+
+
+def _add(a, b):
+    A = (a[1] - a[0]) * (b[1] - b[0]) % _P
+    B = (a[1] + a[0]) * (b[1] + b[0]) % _P
+    C = 2 * a[3] * b[3] * _D % _P
+    D = 2 * a[2] * b[2] % _P
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _P, G * H % _P, F * G % _P, E * H % _P)
+
+
+def _mul(s: int, pt):
+    q = (0, 1, 1, 0)
+    while s:
+        if s & 1:
+            q = _add(q, pt)
+        pt = _add(pt, pt)
+        s >>= 1
+    return q
+
+
+def _same(a, b) -> bool:
+    return (a[0] * b[2] - b[0] * a[2]) % _P == 0 and (a[1] * b[2] - b[1] * a[2]) % _P == 0
+
+
+def _decompress(s: bytes):
+    if len(s) != 32:
+        return None
+    y = int.from_bytes(s, "little")
+    sign, y = y >> 255, y & ((1 << 255) - 1)
+    x = _recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _P)
+
+
+def ed25519_verify(pub: bytes, msg: bytes, sig: bytes) -> bool:
+    if len(pub) != 32 or len(sig) != 64:
+        return False
+    A, R = _decompress(pub), _decompress(sig[:32])
+    s = int.from_bytes(sig[32:], "little")
+    if A is None or R is None or s >= _L:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + pub + msg).digest(), "little") % _L
+    return _same(_mul(s, _G), _add(R, _mul(h, A)))
+
+
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey as _CryptoKey
+except Exception:       # optional
+    _CryptoKey = None
+
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def b58decode(s: str) -> bytes:
+    n = 0
+    for c in s:
+        n = n * 58 + _B58.index(c)
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + raw
+
+
+def did_public_key(did: str) -> bytes:
+    """The raw Ed25519 key in a did:key (multibase base58btc 'z', multicodec 0xed 0x01)."""
+    if not DID_RE.fullmatch(did or ""):
+        raise ValueError(f"not an Ed25519 did:key: {did!r}")
+    raw = b58decode(did[len("did:key:z"):])
+    if raw[:2] != b"\xed\x01" or len(raw) != 34:
+        raise ValueError(f"not an Ed25519 did:key: {did!r}")
+    return raw[2:]
+
+
+def b64u_decode(sig: str) -> bytes | None:
+    if not isinstance(sig, str) or len(sig) != 86 or not re.fullmatch(r"[A-Za-z0-9_-]{86}", sig):
+        return None
+    return base64.urlsafe_b64decode(sig + "==")
+
+
+def verify_sig(did: str, message: str, sig: str) -> tuple[bool, bool | None]:
+    """(built-in verdict, cryptography's verdict or None when that package is absent)."""
+    raw = b64u_decode(sig)
+    try:
+        pub = did_public_key(did)
+    except ValueError:
+        return False, (False if _CryptoKey else None)
+    if raw is None:
+        return False, (False if _CryptoKey else None)
+    ours = ed25519_verify(pub, message.encode("utf-8"), raw)
+    theirs = None
+    if _CryptoKey is not None:
+        try:
+            _CryptoKey.from_public_bytes(pub).verify(raw, message.encode("utf-8"))
+            theirs = True
+        except Exception:
+            theirs = False
+    return ours, theirs
+
+
+# ---------------------------------------------------------------- venue export parsing
+
+def parse_export(body: bytes, room: str, referee: str) -> tuple[list[dict], Counter, list[str]]:
+    """Referee posts from a raw /r/<room>/export body, each signature re-checked over
+    `<room>|<nonce>|<text>` exactly as stored. Nonces are kept as their digits (they may exceed 2^53)."""
+    posts, stats, problems = [], Counter(), []
+    for lineno, line in enumerate(body.decode("utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        stats["lines"] += 1
+        try:
+            rec = json.loads(line, parse_int=str)
+        except ValueError:
+            stats["unparseable line"] += 1
+            continue
+        did = rec.get("from") or rec.get("did")
+        if did != referee:
+            stats["not from the referee"] += 1
+            continue
+        nonce, text, sig = rec.get("nonce"), rec.get("text"), rec.get("sig")
+        if not sig:
+            stats["no signature (not re-verifiable)"] += 1
+            continue
+        ours, theirs = verify_sig(did, f"{room}|{nonce}|{text}", sig)
+        if theirs is not None and theirs != ours:
+            problems.append(f"{room} line {lineno}: built-in and cryptography Ed25519 disagree")
+        if not ours:
+            stats["signature FAILED"] += 1
+            problems.append(f"{room} seq {rec.get('seq')}: signature does not verify")
+            continue
+        stats["signature verified"] += 1
+        try:
+            post = json.loads(text)
+        except (TypeError, ValueError):
+            stats["verified but text is not JSON"] += 1
+            continue
+        if isinstance(post, dict):
+            post["_seq"], post["_ts"] = int(rec.get("seq", 0)), rec.get("ts")
+            posts.append(post)
+    return posts, stats, problems
+
+
+def owner_from_note(text: str) -> str | None:
+    found = DID_RE.findall(text or "")
+    return found[0] if len(set(found)) == 1 else None
+
+
+# ---------------------------------------------------------------- stage: fetch
+
+def load_index() -> dict:
+    return json.loads((RECORDS / "index.json").read_text(encoding="utf-8"))
+
+
+def expected_hash(entry: dict) -> str | None:
+    return entry.get("file") if entry.get("status") == "full" else entry.get("sha256")
+
+
+def cmd_fetch(args) -> int:
+    g = Getter()
+    status, body, _ = g.get(f"{ARCHIVE}/index.json")
+    if status != 200:
+        log(f"fetch: index.json -> HTTP {status}; keeping any local copy")
+        if not (RECORDS / "index.json").exists():
+            return 1
+    else:
+        json.loads(body)
+        write_atomic(RECORDS / "index.json", body)
+    idx = load_index()
+    sweeps = sorted(idx.get("sweeps", []), key=lambda e: e["n"])
+    bad = [e for e in sweeps if not PATH_RE.fullmatch(str(e.get("path"))) or not isinstance(e.get("bytes"), int)]
+    if bad:
+        log(f"fetch: {len(bad)} index entries have an unexpected path or size; refusing them (first: {bad[0]})")
+    sweeps = [e for e in sweeps if e not in bad]
+    lines = [f"{expected_hash(e)}  {e['path']}\n" for e in sweeps if expected_hash(e)]
+    write_atomic(RECORDS / "expected.sha256", "".join(lines).encode())
+    total = sum(e["bytes"] for e in sweeps)
+    log(f"fetch: index lists {len(sweeps)} records, {total} bytes (sweeps {sweeps[0]['n']}..{sweeps[-1]['n']})")
+    t0, done_bytes, fetched, skipped, failed = time.monotonic(), 0, 0, 0, []
+    for i, e in enumerate(sweeps, 1):
+        dest = RECORDS / e["path"]
+        if dest.exists() and dest.stat().st_size == e["bytes"]:
+            skipped += 1
+        else:
+            ok = False
+            for _ in range(3):
+                st, _, _ = g.get(f"{ARCHIVE}/{e['path']}", dest=dest)
+                if st == 200 and dest.exists() and dest.stat().st_size == e["bytes"]:
+                    ok = True
+                    break
+                log(f"fetch: sweep {e['n']} {e['path']}: HTTP {st}, size "
+                    f"{dest.stat().st_size if dest.exists() else 'missing'} (index says {e['bytes']})")
+            if ok:
+                fetched += 1
+            else:
+                failed.append(e["n"])
+                if dest.exists() and dest.stat().st_size != e["bytes"]:
+                    dest.unlink()
+        done_bytes += e["bytes"]
+        if i % args.every == 0 or i == len(sweeps):
+            el = time.monotonic() - t0
+            log(f"fetch: {i}/{len(sweeps)} (sweep {e['n']}) {done_bytes / 1e9:.2f}/{total / 1e9:.2f} GB; "
+                f"downloaded {fetched}, present {skipped}, failed {len(failed)}; "
+                f"{g.bytes / 1e6:.0f} MB over the wire in {el:.0f}s")
+    dump_json(CACHE / "fetch.json", {"at": utc(), "records": len(sweeps), "bytes": total, "downloaded": fetched,
+                                     "already_present": skipped, "failed": failed, "wire_bytes": g.bytes,
+                                     "requests": g.requests})
+    log(f"fetch: done; {fetched} downloaded, {skipped} already present, {len(failed)} failed {failed[:20]}")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------- stage: venue
+
+def cmd_venue(args) -> int:
+    g = Getter()
+    VENUE_DIR.mkdir(parents=True, exist_ok=True)
+    reads = [(f"{VENUE}/kv/room-owners/{PNL_ROOM}", VENUE_DIR / f"room-owners_{PNL_ROOM}.txt"),
+             (f"{VENUE}/kv/room-owners/{PRICE_ROOM}", VENUE_DIR / f"room-owners_{PRICE_ROOM}.txt"),
+             (f"{VENUE}/r/{PNL_ROOM}/export", VENUE_DIR / f"{PNL_ROOM}.export.jsonl"),
+             (f"{VENUE}/r/{PRICE_ROOM}/export", VENUE_DIR / f"{PRICE_ROOM}.export.jsonl")]
+    meta_path = VENUE_DIR / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    for url, dest in reads:
+        if dest.exists() and dest.stat().st_size and not args.refresh:
+            log(f"venue: {dest.name} cached ({dest.stat().st_size} bytes, fetched {meta.get(dest.name, {}).get('at')}); not re-read")
+            continue
+        status, body, headers = g.get(url, timeout=120)
+        if status != 200:
+            log(f"venue: GET {url} -> HTTP {status}")
+            return 1
+        write_atomic(dest, body)
+        meta[dest.name] = {"url": url, "at": utc(), "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                           "generation": headers.get("X-Room-Generation") or headers.get("x-room-generation")}
+        log(f"venue: {dest.name} {len(body)} bytes")
+    dump_json(meta_path, meta)
+    return 0
+
+
+# ---------------------------------------------------------------- stage: verify
+
+def pnl_posts(referee: str) -> tuple[dict, Counter, list, list]:
+    body = (VENUE_DIR / f"{PNL_ROOM}.export.jsonl").read_bytes()
+    posts, stats, problems = parse_export(body, PNL_ROOM, referee)
+    by_n, dup = {}, []
+    for p in posts:
+        if p.get("t") != "pnl" or type(p.get("n")) is not int:
+            stats["verified, not a pnl post"] += 1
+            continue
+        if p["n"] in by_n:
+            dup.append(p["n"])
+            continue
+        by_n[p["n"]] = p
+    return by_n, stats, problems, dup
+
+
+def seed_post(referee: str) -> tuple[dict | None, Counter, list]:
+    path = VENUE_DIR / f"{PRICE_ROOM}.export.jsonl"
+    if not path.exists():
+        return None, Counter(), [f"{path.name} not fetched"]
+    posts, stats, problems = parse_export(path.read_bytes(), PRICE_ROOM, referee)
+    seeds = [p for p in posts if p.get("t") == "seed"]
+    return (seeds[0] if seeds else None), stats, problems
+
+
+def is_redacted(t) -> bool:
+    return isinstance(t, dict) and "redacted" in t
+
+
+def fingerprint(args, *extra: Path) -> str:
+    """Changes whenever an input to verify/replay changes: index, venue files, every record's size and
+    mtime, this script, the options, and any `extra` files (the fold, contest.json)."""
+    h = hashlib.sha256()
+    h.update(Path(__file__).read_bytes())
+    h.update(json.dumps([args.referee, args.asof]).encode())
+    for p in [RECORDS / "index.json", *sorted(VENUE_DIR.glob("*")), *extra]:
+        if p.exists():
+            h.update(p.name.encode() + p.read_bytes())
+    for e in sorted(load_index()["sweeps"], key=lambda e: e["n"]):
+        p = RECORDS / e["path"]
+        st = p.stat() if p.exists() else None
+        h.update(f"{e['path']}:{st.st_size if st else -1}:{st.st_mtime_ns if st else -1}\n".encode())
+    return h.hexdigest()
+
+
+def cached(path: Path, fp: str, force: bool) -> bool:
+    if force or not path.exists():
+        return False
+    try:
+        return json.loads(path.read_text()).get("fingerprint") == fp
+    except ValueError:
+        return False
+
+
+def cmd_verify(args) -> int:
+    fp = fingerprint(args)
+    if cached(CACHE / "verify.json", fp, args.force):
+        log("verify: inputs unchanged since the last run; reusing cache/verify.json (--force to redo)")
+        return 0
+    notes = {r: (VENUE_DIR / f"room-owners_{r}.txt").read_text(encoding="utf-8", errors="replace")
+             for r in (PNL_ROOM, PRICE_ROOM) if (VENUE_DIR / f"room-owners_{r}.txt").exists()}
+    owners = {r: owner_from_note(t) for r, t in notes.items()}
+    referee = args.referee or owners.get(PNL_ROOM)
+    if not referee:
+        log("verify: no referee DID (room-owners note unreadable and no --referee)")
+        return 1
+    by_n, pstats, problems, dup = pnl_posts(referee)
+    seed, sstats, sproblems = seed_post(referee)
+    idx = load_index()
+    sweeps = sorted(idx["sweeps"], key=lambda e: e["n"])
+    log(f"verify: referee {referee}; {len(by_n)} signed pnl posts (n {min(by_n)}..{max(by_n)}), {len(sweeps)} index records")
+
+    # the replay stops at the last sweep with a record and a signed board, with every record before it
+    have = [e["n"] for e in sweeps]
+    asof = max(n for n in have if n in by_n)
+    if args.asof:
+        asof = min(asof, args.asof)
+    contiguous = have[:asof] == list(range(1, asof + 1))
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    ev_tmp, ex_tmp = CACHE / "events.jsonl.part", CACHE / "expected.jsonl.part"
+    rows, hash_bad, missing, file_mismatch, unparseable = [], [], [], [], []
+    counts = Counter()
+    first_input = None
+    t0 = time.monotonic()
+    with open(ev_tmp, "w", encoding="utf-8") as ev, open(ex_tmp, "w", encoding="utf-8") as ex:
+        ev.write("SEED-PLACEHOLDER\n")
+        for i, e in enumerate(sweeps, 1):
+            n, status = e["n"], e["status"]
+            post = by_n.get(n)
+            row = {"n": n, "status": status, "bytes": e["bytes"], "index_file": e["file"],
+                   "posted_file": post.get("file") if post else None, "index_redacted": e.get("redacted", 0)}
+            row["file_match"] = None if post is None else (post.get("file") == e["file"])
+            if row["file_match"] is False:
+                file_mismatch.append(n)
+            path = RECORDS / e["path"]
+            if not path.exists() or path.stat().st_size != e["bytes"]:
+                row["hash"] = "missing"
+                missing.append(n)
+                rows.append(row)
+                continue
+            data = path.read_bytes()
+            digest = hashlib.sha256(data).hexdigest()
+            row["sha256"] = digest
+            if status == "full":
+                target = post.get("file") if post else None
+                row["hash"] = ("ok" if digest == target else "MISMATCH") if target else \
+                    ("ok vs index only (no signed post)" if digest == e["file"] else "MISMATCH vs index")
+            else:
+                row["hash"] = "ok" if digest == e.get("sha256") else "MISMATCH"
+            if not row["hash"].startswith("ok"):
+                hash_bad.append(n)
+            counts[f"{status}: {row['hash']}"] += 1
+            try:
+                rec = json.loads(data)
+            except ValueError:
+                row["parse"] = "FAILED"
+                unparseable.append(n)
+                rows.append(row)
+                continue
+            inp, out = rec.get("input") or {}, rec.get("output") or {}
+            trades, outs = inp.get("trades") or [], out.get("trades") or []
+            red_in = [k for k, t in enumerate(trades) if is_redacted(t)]
+            red_out = [k for k, t in enumerate(outs) if is_redacted(t)]
+            row.update(trades=len(trades), redacted=len(red_in), redacted_out=len(red_out),
+                       redaction_aligned=(red_in == red_out), input_n=inp.get("n"))
+            if n == 1:
+                first_input = inp
+            if n <= asof:
+                visible = [t for t in trades if not is_redacted(t)]
+                ev.write(json.dumps({**inp, "trades": visible}, separators=(",", ":")) + "\n")
+                ex.write(json.dumps({"n": n, "minted": out.get("minted"), "global_price": out.get("global_price"),
+                                     "reference": out.get("reference"), "close": out.get("close"),
+                                     "visible": [o for o in outs if not is_redacted(o)],
+                                     "redacted": len(red_in)}, separators=(",", ":")) + "\n")
+            rows.append(row)
+            if i % args.every == 0 or i == len(sweeps):
+                log(f"verify: {i}/{len(sweeps)} records hashed and parsed ({time.monotonic() - t0:.0f}s)")
+
+    # seed: the referee's signed seed post, cross-checked with record 1's reference (the fold's sweep-1 ref)
+    seed_px, seed_src = None, None
+    if seed and isinstance(seed.get("price"), str):
+        seed_px, seed_src = seed["price"], f"signed seed post, {PRICE_ROOM} seq {seed['_seq']} ({seed['_ts']})"
+    elif first_input:
+        seed_px, seed_src = first_input.get("ref"), "record 1 input.ref (no signed seed post available)"
+    mark = by_n[asof]["mark"]
+    with open(ev_tmp, encoding="utf-8") as src, open(CACHE / "events.jsonl.tmp", "w", encoding="utf-8") as dst:
+        src.readline()
+        dst.write(json.dumps({"t": "seed", "px": seed_px}) + "\n")
+        for line in src:
+            dst.write(line)
+        dst.write(json.dumps({"t": "final", "px": mark}) + "\n")
+    os.replace(CACHE / "events.jsonl.tmp", CACHE / "events.jsonl")
+    ev_tmp.unlink()
+    os.replace(ex_tmp, CACHE / "expected.jsonl")
+
+    manifest_sha = hashlib.sha256((args.repo / "manifest.json").read_bytes()).hexdigest() \
+        if (args.repo / "manifest.json").exists() else None
+    result = {
+        "at": utc(), "fingerprint": fp, "referee": referee, "referee_source": {r: owners.get(r) for r in owners},
+        "referee_override": bool(args.referee), "asof": asof, "records_contiguous_to_asof": contiguous,
+        "index_sweeps": [have[0], have[-1]], "index_sha256": sha256_file(RECORDS / "index.json"),
+        "pnl": {"posts": len(by_n), "range": [min(by_n), max(by_n)], "duplicates": dup, "stats": dict(pstats),
+                "problems": problems},
+        "price_room": {"stats": dict(sstats), "problems": sproblems},
+        "seed": {"px": seed_px, "source": seed_src, "record1_ref": (first_input or {}).get("ref"),
+                 "package": seed.get("package") if seed else None, "manifest_sha256": manifest_sha},
+        "mark": mark, "board_asof": by_n[asof].get("top"),
+        "hash": dict(counts), "hash_bad": hash_bad, "missing": missing, "file_mismatch": file_mismatch,
+        "unparseable": unparseable,
+        "no_signed_post": [r["n"] for r in rows if r["posted_file"] is None],
+        "boards": {str(n): {"mark": p.get("mark"), "top": p.get("top")} for n, p in by_n.items() if n <= asof},
+        "rows": rows,
+    }
+    dump_json(CACHE / "verify.json", result)
+    log(f"verify: done; as-of sweep {asof}; hashes {dict(counts)}; file mismatches {len(file_mismatch)}; "
+        f"missing {len(missing)}; signatures {dict(pstats)}")
+    return 0
+
+
+# ---------------------------------------------------------------- stage: replay
+
+def load_fold(repo: Path):
+    path = repo / "close_call_fold.py"
+    spec = importlib.util.spec_from_file_location("close_call_fold", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod        # dataclasses look their module up while the file executes
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def cents(x: Decimal) -> Decimal:
+    return x.quantize(CENT, rounding=ROUND_HALF_EVEN)
+
+
+HALF_CENT = Decimal("0.005")
+
+
+def board_check(fold, board: dict) -> tuple[dict, bool, list]:
+    """Classify each board key against the fold's current accounts.
+
+    The referee values open positions at its unrounded global price G and posts G rounded to the cent
+    as `mark`. A key's score is linear in G (value_at(G) = value_at(0) + position * G), so:
+      exact       the fold's own G rounds to the mark and reproduces the posted score to the cent;
+      consistent  some G within the mark's rounding (mark ± 0.005) reproduces it: the account matches,
+                  only the unrounded global price (which hidden volume moves) is unknown;
+      off         no such G: the key's account differs from the referee's.
+    Returns ({key: (status, score at the G used, posted)}, fold G rounds to mark, [lo, hi] of the G
+    interval every non-off key agrees on; lo > hi means they need different G)."""
+    mark = Decimal(board["mark"])
+    lo, hi = mark - HALF_CENT, mark + HALF_CENT
+    g = fold.global_px
+    g_ok = cents(g) == mark
+    g_used = g if g_ok else mark
+    common = [lo, hi]
+    out = {}
+    for k, posted in board["top"]:
+        p = Decimal(posted)
+        acct = fold.accounts.get(k)
+        if acct is None:
+            out[k] = ("off", None, p)
+            continue
+        base, q = acct.value_at(Decimal(0)) - fold.mint, acct.position
+        score = base + q * g_used
+        if g_ok and cents(score) == p:
+            status, iv = "exact", (g, g)
+        else:
+            if q == 0:
+                iv = (lo, hi) if abs(base - p) <= HALF_CENT else None
+            else:
+                a, b = sorted(((p - HALF_CENT - base) / q, (p + HALF_CENT - base) / q))
+                a, b = max(a, lo), min(b, hi)
+                iv = (a, b) if a <= b else None
+            status = "consistent" if iv else "off"
+        if iv:
+            common = [max(common[0], iv[0]), min(common[1], iv[1])]
+        out[k] = (status, score, p)
+    return out, g_ok, common
+
+
+def cmd_replay(args) -> int:
+    try:
+        if os.getpriority(os.PRIO_PROCESS, 0) < 19:
+            os.setpriority(os.PRIO_PROCESS, 0, 19)
+    except OSError as e:
+        log(f"replay: could not lower priority ({e}); run it as `nice -n 19 ... replay`")
+    fp = fingerprint(args, args.repo / "close_call_fold.py", args.repo / "contest.json")
+    if cached(CACHE / "replay.json", fp, args.force):
+        log("replay: inputs unchanged since the last run; reusing cache/replay.json (--force to redo)")
+        return 0
+    fold_mod = load_fold(args.repo)
+    contest = json.loads((args.repo / "contest.json").read_text(encoding="utf-8"))
+    cfg = {k: contest[k] for k in fold_mod.DEFAULTS if k in contest}     # as the fold's own CLI does
+    ver = json.loads((CACHE / "verify.json").read_text())
+    asof, boards = ver["asof"], ver["boards"]
+    top_keys = [k for k, _ in ver["board_asof"]]
+    touch = {k: Counter() for k in top_keys}
+    first_div = {}
+    last_check, last_common, last_g_ok = {}, [Decimal(1), Decimal(0)], False
+    per_sweep, mismatches = [], []
+    tally = Counter()
+    fold = fold_mod.Fold(cfg)
+    t0 = time.monotonic()
+    log(f"replay: fold {args.repo / 'close_call_fold.py'} (sha256 {sha256_file(args.repo / 'close_call_fold.py')}), "
+        f"niceness {os.getpriority(os.PRIO_PROCESS, 0)}, as-of sweep {asof}")
+    final = None
+    with localcontext() as ctx, open(CACHE / "events.jsonl", encoding="utf-8") as ev, \
+            open(CACHE / "expected.jsonl", encoding="utf-8") as ex:
+        ctx.prec = 60                                   # as close_call_fold.replay() sets it
+        for line in ev:
+            event = json.loads(line)
+            kind = event.get("t")
+            if kind == "seed":
+                fold.seed(event.get("px"))
+                continue
+            if kind == "final":
+                final = fold.final(event.get("px"))
+                continue
+            got = fold.sweep(event.get("n"), event.get("ref"), event.get("close"),
+                             event.get("owners", []), event.get("trades", []))
+            want = json.loads(ex.readline())
+            n = got["sweep"]
+            assert want["n"] == n, f"expected.jsonl out of step at sweep {n}"
+            row = {"n": n, "visible": len(want["visible"]), "redacted": want["redacted"]}
+            if len(got["trades"]) != len(want["visible"]):
+                row["count_mismatch"] = True
+            match = mism = 0
+            for trade, ours, theirs in zip(event.get("trades", []), got["trades"], want["visible"]):
+                keys = {trade.get("maker"), trade.get("countersigner")} if isinstance(trade, dict) else set()
+                same = ours == theirs
+                if same:
+                    match += 1
+                else:
+                    mism += 1
+                    kind_ = "id" if ours.get("id") != theirs.get("id") else \
+                        "outcome" if (ours.get("outcome"), ours.get("reason")) != (theirs.get("outcome"), theirs.get("reason")) \
+                        else "fees"
+                    tally[f"mismatch: {kind_}"] += 1
+                    if len(mismatches) < 200:
+                        mismatches.append({"n": n, "id": ours.get("id"), "fold": ours, "record": theirs,
+                                           "maker": trade.get("maker"), "countersigner": trade.get("countersigner")})
+                for k in keys & touch.keys():
+                    touch[k]["visible"] += 1
+                    if not same:
+                        touch[k]["mismatch"] += 1
+                        touch[k].setdefault("first_mismatch", n)
+            tally["visible trades"] += len(want["visible"])
+            tally["matched"] += match
+            tally["mismatched"] += mism
+            tally["unpaired"] += abs(len(got["trades"]) - len(want["visible"]))
+            row.update(matched=match, mismatched=mism,
+                       minted_ok=got["minted"] == want["minted"],
+                       global_fold=got["global_price"], global_record=want["global_price"])
+            if not row["minted_ok"]:
+                tally["sweeps with a minted-list difference"] += 1
+            board = boards.get(str(n))
+            if board:
+                checked, g_ok, common = board_check(fold, board)
+                st = Counter(s for s, _, _ in checked.values())
+                for k, (s, _, _) in checked.items():
+                    if s == "off":
+                        first_div.setdefault(k, n)
+                row.update(board_exact=st["exact"], board_consistent=st["consistent"], board_off=st["off"],
+                           global_rounds_to_mark=g_ok, common_global_ok=common[0] <= common[1])
+                if n == asof:
+                    last_check, last_common, last_g_ok = checked, common, g_ok
+            per_sweep.append(row)
+            if n % args.every == 0 or n == asof:
+                log(f"replay: sweep {n}/{asof}; visible trades {tally['visible trades']}, "
+                    f"matched {tally['matched']}, mismatched {tally['mismatched']} ({time.monotonic() - t0:.0f}s)")
+    table = []
+    six = Decimal("0.000001")
+    for rank, (k, posted) in enumerate(ver["board_asof"], 1):
+        status, score, p = last_check[k]
+        tc = touch.get(k, Counter())
+        if status != "off":
+            red = "none detected"
+        elif tc.get("mismatch"):
+            red = f"likely ({tc['mismatch']} visible trade(s) on this key also differ, first at sweep {tc['first_mismatch']})"
+        else:
+            red = "yes (inferred: every visible trade on this key matched)"
+        table.append({"rank": rank, "key": k, "posted": posted,
+                      "fold": str(score.quantize(six)) if score is not None else None, "status": status,
+                      "reproducible": status != "off",
+                      "delta": str((score - p).quantize(six)) if score is not None else None,
+                      "redacted_touch": red, "visible_trades": tc.get("visible", 0),
+                      "visible_mismatches": tc.get("mismatch", 0), "first_board_divergence": first_div.get(k)})
+    knock = Counter()
+    for m in mismatches:
+        f_, r_ = m["fold"], m["record"]
+        if f_.get("outcome") == "settled" and r_.get("reason") == "settled":
+            knock["fold settled, record void 'settled': the id had already settled in a redacted trade"] += 1
+        elif f_.get("outcome") == "settled" and r_.get("reason") == "funds":
+            knock["fold settled, record void 'funds': hidden trades had used the account's free POLF"] += 1
+        else:
+            knock[f"other: fold {f_.get('outcome')}/{f_.get('reason')}, record {r_.get('outcome')}/{r_.get('reason')}"] += 1
+    dump_json(CACHE / "replay.json", {
+        "at": utc(), "fingerprint": fp, "asof": asof, "fold_sha256": sha256_file(args.repo / "close_call_fold.py"),
+        "config": cfg, "tally": dict(tally), "mismatches": mismatches, "mismatch_kinds": dict(knock),
+        "per_sweep": per_sweep, "table": table,
+        "asof_global": {"fold_global_rounds_to_mark": last_g_ok, "common_interval": [str(x) for x in last_common],
+                        "common_ok": last_common[0] <= last_common[1]},
+        "final": {k: v for k, v in final.items() if k != "standings"},
+        "final_top": final["standings"][:40], "elapsed_s": round(time.monotonic() - t0, 1)})
+    log(f"replay: done in {time.monotonic() - t0:.0f}s; {dict(tally)}; board reproducible "
+        f"{sum(r['reproducible'] for r in table)}/{len(table)}")
+    return 0
+
+
+# ---------------------------------------------------------------- stage: report
+
+def cmd_report(args) -> int:
+    ver = json.loads((CACHE / "verify.json").read_text())
+    rep = json.loads((CACHE / "replay.json").read_text()) if (CACHE / "replay.json").exists() else None
+    fetch = json.loads((CACHE / "fetch.json").read_text()) if (CACHE / "fetch.json").exists() else {}
+    meta = json.loads((VENUE_DIR / "meta.json").read_text()) if (VENUE_DIR / "meta.json").exists() else {}
+    rows = ver["rows"]
+    asof = ver["asof"]
+    upto = [r for r in rows if r["n"] <= asof]
+    full = [r for r in rows if r["status"] == "full"]
+    red = [r for r in rows if r["status"] == "redacted"]
+    red_trades = sum(r.get("redacted", 0) for r in rows)
+    red_trades_asof = sum(r.get("redacted", 0) for r in upto)
+    trades_asof = sum(r.get("trades", 0) for r in upto)
+    idx_disagree = [r["n"] for r in rows if "redacted" in r and r["redacted"] != r["index_redacted"]]
+    unaligned = [r["n"] for r in rows if r.get("redaction_aligned") is False]
+    ps = ver["pnl"]["stats"]
+    L = []
+    w = L.append
+    w("# close-1 public verification report\n")
+    w(f"Generated {utc()} by `verify/close1_verify_public.py` from public data only "
+      f"(archive `{ARCHIVE}`, venue `{VENUE}`; HTTP GET only).\n")
+    w("## As of\n")
+    w(f"- **As-of sweep: {asof}**: the last sweep with both an archived record and a signed `d-close1-pnl` post. "
+      f"Index covers sweeps {ver['index_sweeps'][0]}..{ver['index_sweeps'][1]}; signed pnl posts cover "
+      f"{ver['pnl']['range'][0]}..{ver['pnl']['range'][1]}.")
+    w(f"- Posted mark at sweep {asof}: `{ver['mark']}` (the referee's global price rounded to the cent, from the signed pnl post).")
+    w(f"- Records contiguous 1..{asof}: {'yes' if ver['records_contiguous_to_asof'] else 'NO'}.")
+    w(f"- index.json sha256 `{ver['index_sha256']}`; pnl export fetched "
+      f"{meta.get(PNL_ROOM + '.export.jsonl', {}).get('at')} (sha256 `{meta.get(PNL_ROOM + '.export.jsonl', {}).get('sha256')}`).\n")
+    w("## Referee key and signatures\n")
+    src = ver["referee_source"]
+    w(f"- Referee DID: `{ver['referee']}`" + (" (given with --referee)" if ver["referee_override"] else ""))
+    w(f"- Source: the venue's server-enforced owner notes `GET {VENUE}/kv/room-owners/<room>`, the key "
+      f"technocore.chat requires on every post in a `d-` room: {PNL_ROOM} → `{src.get(PNL_ROOM)}`, "
+      f"{PRICE_ROOM} → `{src.get(PRICE_ROOM)}`. The contest repo does not name the key (its rules say the "
+      "launch record and seed pin it); no launch record was available to cross-check.")
+    w(f"- `d-close1-pnl` export: {ps.get('lines', 0)} lines; **{ps.get('signature verified', 0)} signatures verified, "
+      f"{ps.get('signature FAILED', 0)} failed**, {ps.get('no signature (not re-verifiable)', 0)} unsigned, "
+      f"{ps.get('not from the referee', 0)} from another key. Message signed: `d-close1-pnl|<nonce>|<text>` "
+      "(technocore.chat's did:key lane), Ed25519, checked by a built-in RFC 8032 verifier"
+      + (" and cross-checked with the `cryptography` package." if _CryptoKey else "."))
+    if ver["pnl"]["problems"]:
+        w(f"- Signature problems: {ver['pnl']['problems'][:10]}")
+    if ver["pnl"]["duplicates"]:
+        w(f"- Duplicate pnl posts for sweeps {ver['pnl']['duplicates'][:20]} (first kept).")
+    fm, nsp = ver["file_mismatch"], ver["no_signed_post"]
+    w(f"- Index `file` vs signed post `file`: **{len([r for r in rows if r['file_match']])} equal, {len(fm)} differ**"
+      + (f" (sweeps {fm[:30]})" if fm else "") + f"; {len(nsp)} index sweeps have no signed post"
+      + (f" ({nsp[:10]}{' ...' if len(nsp) > 10 else ''})" if nsp else "") + ".")
+    sd = ver["seed"]
+    w(f"- Seed `{sd['px']}` from the {sd['source']}; record 1's `input.ref` is `{sd['record1_ref']}` "
+      f"({'agrees' if sd['px'] == sd['record1_ref'] else 'DISAGREES'}).")
+    if sd.get("package"):
+        w(f"- Seed post pins package `{sd['package']}`; local `close-call/manifest.json` sha256 `{sd['manifest_sha256']}` "
+          f"({'match' if sd['package'] == sd['manifest_sha256'] else 'DIFFERENT'}).")
+    w("")
+    w("## Record hashes\n")
+    fb = [r["n"] for r in full if not str(r.get("hash", "")).startswith("ok")]
+    rb = [r["n"] for r in red if not str(r.get("hash", "")).startswith("ok")]
+    w(f"- `full` records: {len(full)}; sha256 equals the signed post's `file`: {sum(r.get('hash') == 'ok' for r in full)}; "
+      f"problems: {len(fb)}" + (f" ({fb[:20]})" if fb else ""))
+    w(f"- `redacted` records: {len(red)}; sha256 equals the index's own `sha256`: {sum(r.get('hash') == 'ok' for r in red)}; "
+      f"problems: {len(rb)}" + (f" ({rb[:20]})" if rb else ""))
+    w(f"- Missing locally: {len(ver['missing'])}" + (f" ({ver['missing'][:20]})" if ver["missing"] else ""))
+    if ver.get("unparseable"):
+        w(f"- Not valid JSON (left out of the replay): {ver['unparseable'][:20]}")
+    w("- Limitation: a redacted record hashes to the index's `sha256`, which nobody signed. Its content is "
+      "bound to the referee's signature only through the full record (hash = signed `file`), which is not "
+      "public. So redacted records are checked for integrity against the index, not for authenticity.\n")
+    w("## Redactions\n")
+    w("A trade is one element of a record's `input.trades` (the fold input for that sweep). A redacted trade "
+      "is an element replaced by `{\"redacted\": \"private room\"}`; the matching `output.trades` element is "
+      "redacted the same way, so its keys, terms and outcome are all hidden.\n")
+    w(f"- Redacted trades, all {len(rows)} records: **{red_trades}** of {sum(r.get('trades', 0) for r in rows)} trades "
+      f"in {sum(1 for r in rows if r.get('redacted'))} sweeps.")
+    w(f"- Up to the as-of sweep {asof}: {red_trades_asof} of {trades_asof} trades redacted.")
+    w(f"- Record counts vs the index's `redacted` field: {'all agree' if not idx_disagree else f'{len(idx_disagree)} differ ({idx_disagree[:20]})'}; "
+      f"input/output redaction positions {'aligned in every record' if not unaligned else f'misaligned in {unaligned[:20]}'}.")
+    w("- Per-sweep counts are in `verify/sweeps.csv` (column `redacted`).\n")
+    if rep:
+        t = rep["tally"]
+        try:
+            pinned = json.loads((args.repo / "manifest.json").read_text())["files"]["close_call_fold.py"]["sha256"]
+        except (OSError, ValueError, KeyError):
+            pinned = None
+        pin_note = ("matches the package manifest, whose own hash the signed seed pins" if pinned == rep["fold_sha256"]
+                    else f"DOES NOT match the manifest's {pinned}")
+        w("## Replay\n")
+        w(f"- Fold: `close-call/close_call_fold.py`, sha256 `{rep['fold_sha256']}` ({pin_note}), not modified, "
+          "imported by path; driven sweep by sweep exactly as its `replay()` does "
+          "(decimal precision 60), with each sweep's redacted trades removed. Config from `close-call/contest.json`.")
+        w(f"- Visible trades replayed to sweep {asof}: {t.get('visible trades', 0)}; **matched {t.get('matched', 0)}, "
+          f"mismatched {t.get('mismatched', 0)}**" + (f", unpaired {t['unpaired']}" if t.get("unpaired") else "")
+          + ". A match is an identical outcome object (id, settled/void, reason, maker and taker fee strings).")
+        for kind, v in (rep.get("mismatch_kinds") or {}).items():
+            w(f"  - {v} × {kind}")
+        if rep.get("mismatch_kinds"):
+            w("  An id settles at most once and funds are checked against balances, so a skipped redacted trade "
+              "changes these later visible outcomes. They are knock-on effects of redaction, not referee errors "
+              "the public data can show.")
+        if t.get("sweeps with a minted-list difference"):
+            w(f"- Sweeps whose minted list differs: {t['sweeps with a minted-list difference']}")
+        ps_rows = rep["per_sweep"]
+        boards_n = [r for r in ps_rows if "board_off" in r and (r["board_exact"] + r["board_consistent"] + r["board_off"])]
+        clean_exact = [r["n"] for r in boards_n if r["board_off"] == 0 and r["board_consistent"] == 0]
+        clean_any = [r["n"] for r in boards_n if r["board_off"] == 0 and r.get("common_global_ok")]
+        first_bad = next((r["n"] for r in boards_n if r["board_off"]), None)
+        first_mis = next((r["n"] for r in ps_rows if r.get("mismatched")), None)
+        first_red = next((r["n"] for r in rows if r.get("redacted")), None)
+        w(f"- First sweep with a redacted trade: {first_red}; first visible-trade mismatch: {first_mis}; "
+          f"first signed board with a key the fold cannot reproduce: {first_bad}.")
+        w(f"- Signed boards (non-empty) reproduced key-for-key: {len(clean_exact)} of {len(boards_n)} exactly "
+          f"(sweeps {', '.join(map(str, clean_exact[:25]))}{' ...' if len(clean_exact) > 25 else ''}); "
+          f"{len(clean_any)} of {len(boards_n)} with every key exact or consistent under one common global price.")
+        w(f"- Fold totals at sweep {asof} (final at the posted mark {ver['mark']}): {rep['final']['owners']} owners, "
+          f"fees {rep['final']['fees']}, zero-sum check {rep['final']['zero_sum']} (visible trades only).")
+        w(f"- Replay time {rep['elapsed_s']} s under `nice -n 19`.\n")
+        ag = rep.get("asof_global", {})
+        w(f"## Top 25 at sweep {asof}\n")
+        w("How the board is scored: the referee values open positions at its **unrounded** global price (the "
+          "volume-weighted price of the last sweep with settled trades) and posts that price rounded to the cent "
+          "as `mark`. The fold reproduces sweeps 1–17 key-for-key on that rule. A key's score is linear in the "
+          "global price (slope = its net position), so each key is classed as:\n")
+        w("- **exact**: the fold's own global price rounds to the mark and gives the posted score to the cent;")
+        w("- **yes (mark rounding)**: some global price within mark ± 0.005 gives the posted score, so the "
+          "key's cash and lots match and only the unrounded price, which hidden volume moves, is unknown;")
+        w("- **no**: no such price, so the key's account differs from the referee's.\n")
+        w(f"At sweep {asof} the fold's global price {'rounds' if ag.get('fold_global_rounds_to_mark') else 'does NOT round'} "
+          f"to the mark; the global-price interval every reproducible key agrees on is "
+          f"[{ag.get('common_interval', ['?', '?'])[0][:12]}, {ag.get('common_interval', ['?', '?'])[1][:12]}]"
+          f"{'' if ag.get('common_ok') else ' (EMPTY: they need different prices)'}. Fold = the fold's score at its own "
+          "global price if that rounds to the mark, else at the mark (6 dp); delta = fold − posted at that price. "
+          "Redacted-touch: redacted trades hide their keys, so this is inferred. A key's account moves only "
+          "through trades naming it and its mint. If the key is off, its mint matched and every visible trade "
+          "naming it matched the record, then a redacted trade must have touched it.\n")
+        w("| # | key | posted | fold | reproducible | delta | redacted-touch | first board off |")
+        w("|---|---|---:|---:|:---:|---:|---|---:|")
+        label = {"exact": "yes (exact)", "consistent": "yes (mark rounding)", "off": "no"}
+        for r in rep["table"]:
+            w(f"| {r['rank']} | `{r['key']}` | {r['posted']} | {r['fold'] if r['fold'] is not None else 'not minted'} | "
+              f"{label[r['status']]} | {r['delta'] if r['delta'] is not None else '-'} | "
+              f"{r['redacted_touch']} | {r['first_board_divergence'] or '-'} |")
+        n_ok = sum(r["reproducible"] for r in rep["table"])
+        n_ex = sum(r["status"] == "exact" for r in rep["table"])
+        w(f"\n**Reproducible from public data: {n_ok} of {len(rep['table'])} board keys** "
+          f"({n_ex} exact, {n_ok - n_ex} up to the mark's rounding).\n")
+        if rep["mismatches"]:
+            w("### First visible-trade mismatches\n")
+            w("| sweep | id | fold | record |")
+            w("|---:|---|---|---|")
+            for m in rep["mismatches"][:15]:
+                w(f"| {m['n']} | `{m['id']}` | `{json.dumps(m['fold'], sort_keys=True)}` | `{json.dumps(m['record'], sort_keys=True)}` |")
+            w("")
+    else:
+        w("## Replay\n\nNot run.\n")
+    w("## What could not be verified\n")
+    w("- The content of redacted trades (keys, terms, outcomes) and therefore any board score they move.")
+    w("- Authenticity of redacted records beyond the unsigned index hash (see Record hashes).")
+    w("- The referee's unrounded global price once hidden volume has settled (the fold sees only visible volume, "
+      "and the post gives the price to the cent), hence the \"mark rounding\" class in the table.")
+    w("- The referee DID against a signed launch record (none was published where this tool could read it); "
+      "it is taken from the venue's room-owner notes.")
+    if fetch:
+        w(f"\n_Fetch: {fetch.get('records')} records, {fetch.get('bytes')} bytes listed; "
+          f"{fetch.get('downloaded')} downloaded in the last fetch run, {fetch.get('already_present')} already present, "
+          f"failed {fetch.get('failed')}._")
+    write_atomic(REPORT, ("\n".join(L) + "\n").encode())
+
+    rp = {r["n"]: r for r in (rep["per_sweep"] if rep else [])}
+    cols = ["n", "status", "bytes", "hash", "file_match", "trades", "redacted", "index_redacted",
+            "visible", "matched", "mismatched", "minted_ok", "board_exact", "board_consistent", "board_off",
+            "global_rounds_to_mark", "common_global_ok", "global_fold", "global_record"]
+    tmp = SWEEPS_CSV.with_name(SWEEPS_CSV.name + ".part")
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        wr.writeheader()
+        for r in rows:
+            wr.writerow({**r, **rp.get(r["n"], {})})
+    os.replace(tmp, SWEEPS_CSV)
+    log(f"report: wrote {REPORT} and {SWEEPS_CSV}")
+    return 0
+
+
+# ---------------------------------------------------------------- pipeline
+
+def cmd_all(args) -> int:
+    common = ["--repo", str(args.repo), "--every", str(args.every)]
+    if args.referee:
+        common += ["--referee", args.referee]
+    if args.asof:
+        common += ["--asof", str(args.asof)]
+    if args.force:
+        common += ["--force"]
+    steps = [[] if args.skip_fetch else ["fetch"], ["venue"] + (["--refresh"] if args.refresh else []),
+             ["nice", "verify"], ["nice", "replay"], ["report"]]
+    for step in steps:
+        if not step:
+            continue
+        niced = step[0] == "nice"
+        sub = step[1:] if niced else step
+        cmd = (["nice", "-n", "19"] if niced else []) + [sys.executable, str(Path(__file__).resolve())] + sub + common
+        log(f"all: running {' '.join(cmd[:3] if niced else cmd[:2])} ... {' '.join(sub)}", echo=True)
+        code = subprocess.run(cmd).returncode
+        if code and sub[0] != "fetch":
+            log(f"all: {sub[0]} exited {code}; stopping")
+            return code
+        if code:
+            log("all: fetch reported failures; continuing with what is present")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("stage", choices=["fetch", "venue", "verify", "replay", "report", "all"])
+    ap.add_argument("--repo", type=Path, default=DEFAULT_REPO, help="contest repo checkout (default ../close-call)")
+    ap.add_argument("--referee", help="referee did:key (default: the venue's room-owners note for d-close1-pnl)")
+    ap.add_argument("--asof", type=int, help="stop the replay at this sweep")
+    ap.add_argument("--every", type=int, default=25, help="progress line every N records/sweeps")
+    ap.add_argument("--refresh", action="store_true", help="venue: re-read the exports and notes")
+    ap.add_argument("--skip-fetch", action="store_true", help="all: do not touch the archive")
+    ap.add_argument("--force", action="store_true", help="verify/replay: redo even if the inputs are unchanged")
+    args = ap.parse_args()
+    args.repo = args.repo.expanduser().resolve()
+    return {"fetch": cmd_fetch, "venue": cmd_venue, "verify": cmd_verify, "replay": cmd_replay,
+            "report": cmd_report, "all": cmd_all}[args.stage](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
