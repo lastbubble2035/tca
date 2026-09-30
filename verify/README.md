@@ -23,7 +23,7 @@ That fetches (or resumes) the archive, verifies, replays under `nice -n 19` and 
 `verify/REPORT.md`. Progress goes to `verify/progress.log`. A rerun skips records already
 present with the right size. It also reuses the cached verify and replay results when none of
 their inputs changed; add `--force` to redo them, or `--skip-fetch` to leave the archive alone.
-Stages can be run one at a time: `fetch`, `venue`, `verify`, `replay`, `report`.
+Stages can be run one at a time: `fetch`, `venue`, `indexsig`, `verify`, `replay`, `report`.
 
 You need Python 3.10+ (standard library only; the `cryptography` package, if installed, is used to
 cross-check the Ed25519 verifier) and a checkout of the contest package next to this folder
@@ -41,6 +41,8 @@ Tests (synthetic fixtures, no network):
 | Signed pnl posts | `https://technocore.chat/r/d-close1-pnl/export` (raw JSONL, byte-exact) | 1 |
 | Referee's signed seed post | `https://technocore.chat/r/d-close1-price/export`, first post | 1 |
 | Referee DID | `https://technocore.chat/kv/room-owners/d-close1-pnl` and `.../d-close1-price` | 2 |
+| Index signature, detached | `https://challenges.technocore.chat/close-1/index.json.sig` and `.../index.sig` (404 = not published) | 2 per `indexsig` run |
+| Index signature, in a post | `https://technocore.chat/r/d-close1-state/export` and the `d-close1-price` export above | 1 (+1 with `--refresh`) |
 | Fold and config | `../close-call/close_call_fold.py`, `contest.json`, `manifest.json` (local checkout) | none |
 
 The venue exports and notes are read once and cached under `verify/venue/` (`venue --refresh` re-reads them).
@@ -74,6 +76,15 @@ rooms are on `technocore.chat`, whose published limits are 600 reads and 300 wri
    outcomes in memory.
 7. **Comparisons, per sweep.** Each visible trade's fold outcome must equal the record's `output`
    entry, and each signed board's top 25 is checked against the fold's accounts.
+8. **Index signature.** `index.json` itself is not signed in the archive. The `indexsig` stage looks
+   for a referee signature over it in two forms, verified with the same Ed25519 code as the posts:
+   (a) `index.json.sig` or `index.sig` next to it, a detached signature by the referee DID over the
+   raw bytes of `records/index.json`, as 64 raw bytes or text (optionally a JSON object with a `sig`
+   field) in base64url without padding (the venue's post encoding), padded base64/base64url, or
+   multibase base58btc (`z...`); (b) a referee post in `d-close1-state` or `d-close1-price` whose
+   signature verifies and whose JSON text contains the sha256 of those bytes, recomputed locally.
+   The report says `index signature: verified (form a)`, `verified (form b)`, `none published`, or
+   `FAILED (<reason>)` when a published signature does not verify or cannot be read.
 
 ## Adaptations (where the data differed from the obvious reading)
 
@@ -94,13 +105,12 @@ rooms are on `technocore.chat`, whose published limits are 600 reads and 300 wri
 ## Files
 
 - `close1_verify_public.py`: the tool.
-- `records/`: `index.json`, `expected.sha256`, `sweeps/*.json` (full) and `redacted/*.json`.
+- `records/`: `index.json`, `expected.sha256`, `sweeps/*.json` (full) and `redacted/*.json`, plus
+  `index.json.sig` / `index.sig` if the archive publishes them.
 - `venue/`: the cached exports, room-owner notes and fetch metadata.
-- `cache/`: `events.jsonl` (fold input), `expected.jsonl`, `verify.json`, `replay.json`, `fetch.json`.
+- `cache/`: `events.jsonl` (fold input), `expected.jsonl`, `verify.json`, `replay.json`, `fetch.json`,
+  `indexsig.json`.
 - `REPORT.md`, `sweeps.csv` (per-sweep hashes, redactions, matches, board classes), `progress.log`.
 - `tests/test_verify_public.py`: offline tests.
 
 `records/`, `venue/`, `cache/` and `progress.log` are generated on the first run and are not part of the published folder.
-
-`records/`, `venue/`, `cache/` and `progress.log` are generated on first run and are not part of
-the published folder.

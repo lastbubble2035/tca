@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import shutil
@@ -66,6 +67,21 @@ def did_of(seed: bytes) -> str:
 def b64u(raw: bytes) -> str:
     import base64
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def fake_getter(served: dict, requested: list):
+    """A Getter stand-in serving `served[url]` (200) and 404 for anything else."""
+    class FakeGetter:
+        def __init__(self, *_, **__):
+            self.bytes = self.requests = 0
+
+        def get(self, url, dest=None, timeout=0):
+            requested.append(url)
+            self.requests += 1
+            if url not in served:
+                return 404, b"Not Found", {}
+            return 200, served[url], {}
+    return FakeGetter
 
 
 def export_line(seq: int, seed: bytes, room: str, nonce: int, obj, corrupt: bool = False) -> str:
@@ -227,10 +243,18 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(table[k]["status"], "off")
             self.assertTrue(table[k]["redacted_touch"].startswith("yes (inferred"))
             self.assertEqual(table[k]["first_board_divergence"], 2)
+        saved = V.Getter
+        try:
+            V.Getter = fake_getter({}, [])
+            self.assertEqual(V.cmd_indexsig(SimpleNamespace(referee=None, refresh=False)), 0)
+        finally:
+            V.Getter = saved
         self.assertEqual(V.cmd_report(self.args), 0)
         text = V.REPORT.read_text()
         self.assertIn("Reproducible from public data: 1 of 3", text)
         self.assertIn("1 differ", text)
+        self.assertEqual([l for l in text.splitlines() if l.startswith("index signature:")],
+                         ["index signature: none published"])
 
     def test_board_check_exact_at_unrounded_global(self):
         fold = V.load_fold(REPO).Fold()
@@ -295,6 +319,102 @@ class FetchSkipTests(unittest.TestCase):
         finally:
             V.RECORDS, V.CACHE, V.PROGRESS, V.Getter = saved
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+class IndexSigTests(unittest.TestCase):
+    """The signed-index check: a detached signature next to index.json (form a), a signed room post
+    carrying index.json's sha256 (form b), neither, and signatures that do not verify."""
+
+    SIG_URL = f"{V.ARCHIVE}/index.json.sig"
+    STATE_URL = f"{V.VENUE}/r/d-close1-state/export"
+    PRICE_URL = f"{V.VENUE}/r/d-close1-price/export"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="scratch-", dir=HERE))
+        self.saved = (V.RECORDS, V.VENUE_DIR, V.CACHE, V.PROGRESS, V.Getter)
+        V.RECORDS, V.VENUE_DIR, V.CACHE = self.tmp / "records", self.tmp / "venue", self.tmp / "cache"
+        V.PROGRESS = self.tmp / "progress.log"
+        self.ref_seed = bytes([1]) * 32
+        self.referee = did_of(self.ref_seed)
+        self.index = json.dumps({"contest": "close-1", "sweeps": [{"n": 1, "file": "a" * 64}]}).encode()
+        self.digest = hashlib.sha256(self.index).hexdigest()
+        V.RECORDS.mkdir(parents=True)
+        (V.RECORDS / "index.json").write_bytes(self.index)
+        V.VENUE_DIR.mkdir(parents=True)
+        for room in ("d-close1-pnl", "d-close1-price"):
+            (V.VENUE_DIR / f"room-owners_{room}.txt").write_text("header\n\n" + self.referee + "\n")
+        seed = export_line(1, self.ref_seed, "d-close1-price", 50, {"t": "seed", "price": "100.00"})
+        self.served = {self.PRICE_URL: (seed + "\n").encode()}
+
+    def tearDown(self):
+        V.RECORDS, V.VENUE_DIR, V.CACHE, V.PROGRESS, V.Getter = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_check(self) -> dict:
+        self.requested = []
+        V.Getter = fake_getter(self.served, self.requested)
+        self.assertEqual(V.cmd_indexsig(SimpleNamespace(referee=None, refresh=True)), 0)
+        return json.loads((V.CACHE / "indexsig.json").read_text())
+
+    def test_none_published(self):
+        other = export_line(2, self.ref_seed, "d-close1-price", 51, {"t": "price", "sha256": "b" * 64})
+        self.served[self.PRICE_URL] += (other + "\n").encode()
+        res = self.run_check()
+        self.assertEqual(res["line"], "index signature: none published")
+        self.assertEqual(self.requested, [self.SIG_URL, f"{V.ARCHIVE}/index.sig", self.STATE_URL, self.PRICE_URL])
+        self.assertEqual(V.index_sig_line(), "index signature: none published")
+
+    def test_form_a_valid(self):
+        sig = sign(self.ref_seed, self.index)
+        encodings = {"base64url": b64u(sig).encode(), "raw": sig, "base58btc": ("z" + b58encode(sig)).encode(),
+                     "padded base64": base64.b64encode(sig) + b"\n",
+                     "json": json.dumps({"from": self.referee, "sig": b64u(sig)}).encode()}
+        for name, body in encodings.items():
+            with self.subTest(encoding=name):
+                self.served[self.SIG_URL] = body
+                self.assertEqual(self.run_check()["line"], "index signature: verified (form a)")
+        del self.served[self.SIG_URL]
+        self.served[f"{V.ARCHIVE}/index.sig"] = b64u(sig).encode()
+        self.assertEqual(self.run_check()["line"], "index signature: verified (form a)")
+
+    def test_form_b_valid(self):
+        post = export_line(1, self.ref_seed, "d-close1-state", 7, {"t": "index", "sha256": self.digest})
+        self.served[self.STATE_URL] = (post + "\n").encode()
+        res = self.run_check()
+        self.assertEqual(res["line"], "index signature: verified (form b)")
+        self.assertEqual(res["verified"], [{"form": "b", "where": "d-close1-state seq 1"}])
+        self.assertTrue((V.VENUE_DIR / "d-close1-state.export.jsonl").exists())
+
+    def test_form_b_needs_the_recomputed_hash_and_the_referee(self):
+        stale = hashlib.sha256(self.index + b" ").hexdigest()
+        lines = [export_line(1, self.ref_seed, "d-close1-state", 7, {"t": "index", "sha256": stale}),
+                 export_line(2, bytes([9]) * 32, "d-close1-state", 8, {"t": "index", "sha256": self.digest})]
+        self.served[self.STATE_URL] = ("\n".join(lines) + "\n").encode()
+        self.assertEqual(self.run_check()["line"], "index signature: none published")
+
+    def test_tampered_index_bytes_fail(self):
+        self.served[self.SIG_URL] = b64u(sign(self.ref_seed, self.index)).encode()
+        (V.RECORDS / "index.json").write_bytes(self.index.replace(b'"n": 1', b'"n": 2'))
+        line = self.run_check()["line"]
+        self.assertTrue(line.startswith("index signature: FAILED (index.json.sig does not verify"), line)
+
+    def test_other_key_or_bad_encoding_fails(self):
+        self.served[self.SIG_URL] = b64u(sign(bytes([9]) * 32, self.index)).encode()
+        self.assertTrue(self.run_check()["line"].startswith("index signature: FAILED (index.json.sig does not verify"))
+        self.served[self.SIG_URL] = b"<html>hello</html>"
+        self.assertTrue(self.run_check()["line"].startswith("index signature: FAILED (index.json.sig is not a recognised"))
+
+    def test_form_b_forged_post_fails(self):
+        post = export_line(1, self.ref_seed, "d-close1-state", 7, {"t": "index", "sha256": self.digest}, corrupt=True)
+        self.served[self.STATE_URL] = (post + "\n").encode()
+        line = self.run_check()["line"]
+        self.assertEqual(line, "index signature: FAILED (d-close1-state seq 1 carries the index sha256 "
+                               "but its signature does not verify)")
+
+    def test_report_line_goes_stale_with_the_index(self):
+        self.run_check()
+        (V.RECORDS / "index.json").write_bytes(self.index + b"\n")
+        self.assertIn("not checked for the current index.json", V.index_sig_line())
 
 
 if __name__ == "__main__":

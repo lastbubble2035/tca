@@ -1,6 +1,6 @@
 # close-1 public verification report
 
-Generated 2026-09-29T10:43:54Z by `verify/close1_verify_public.py` from public data only (archive `https://challenges.technocore.chat/close-1`, venue `https://technocore.chat`; HTTP GET only).
+Generated 2026-09-30T14:22:50Z by `verify/close1_verify_public.py` from public data only (archive `https://challenges.technocore.chat/close-1`, venue `https://technocore.chat`; HTTP GET only).
 
 ## As of
 
@@ -17,6 +17,8 @@ Generated 2026-09-29T10:43:54Z by `verify/close1_verify_public.py` from public d
 - Index `file` vs signed post `file`: **1119 equal, 0 differ**; 0 index sweeps have no signed post.
 - Seed `226.14` from the signed seed post, d-close1-price seq 1 (2026-09-25T12:05:22.575364Z); record 1's `input.ref` is `226.14` (agrees).
 - Seed post pins package `bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa`; local `close-call/manifest.json` sha256 `bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa` (match).
+
+index signature: none published
 
 ## Record hashes
 

@@ -9,6 +9,9 @@ Stages (run them all with `all`):
            index's own "sha256"), usable with `shasum -a 256 -c`.
   venue    GET, once each and cached: the d-close1-pnl export, the d-close1-price export (for the
            referee's signed seed post) and the room-owners notes of both rooms (the referee DID).
+  indexsig Looks for a referee signature over records/index.json: GET index.json.sig and index.sig
+           next to it in the archive (404 = not published), and the d-close1-state and d-close1-price
+           exports (cached like the venue stage's) for a signed post carrying index.json's sha256.
   verify   Ed25519 signature of every referee post; index "file" == signed pnl post "file" per sweep;
            sha256 of every record; redacted trades per sweep; builds the fold input in verify/cache/.
   replay   Runs close-call/close_call_fold.py (imported by path, unmodified) over the cached input,
@@ -49,7 +52,8 @@ DEFAULT_REPO = Path(os.environ.get("CLOSE_CALL_REPO", str(HERE.parent / "close-c
 
 ARCHIVE = "https://challenges.technocore.chat/close-1"
 VENUE = "https://technocore.chat"
-PNL_ROOM, PRICE_ROOM = "d-close1-pnl", "d-close1-price"
+PNL_ROOM, PRICE_ROOM, STATE_ROOM = "d-close1-pnl", "d-close1-price", "d-close1-state"
+INDEX_SIG_NAMES = ("index.json.sig", "index.sig")
 UA = "close1-verify-public/1.0 (read-only)"
 MIN_INTERVAL = 0.5          # seconds between requests: at most ~2 reads/s, far under 600/min
 CENT = Decimal("0.01")
@@ -267,31 +271,69 @@ def b64u_decode(sig: str) -> bytes | None:
     return base64.urlsafe_b64decode(sig + "==")
 
 
-def verify_sig(did: str, message: str, sig: str) -> tuple[bool, bool | None]:
+def verify_raw(did: str, message: bytes, raw: bytes | None) -> tuple[bool, bool | None]:
     """(built-in verdict, cryptography's verdict or None when that package is absent)."""
-    raw = b64u_decode(sig)
     try:
         pub = did_public_key(did)
     except ValueError:
         return False, (False if _CryptoKey else None)
     if raw is None:
         return False, (False if _CryptoKey else None)
-    ours = ed25519_verify(pub, message.encode("utf-8"), raw)
+    ours = ed25519_verify(pub, message, raw)
     theirs = None
     if _CryptoKey is not None:
         try:
-            _CryptoKey.from_public_bytes(pub).verify(raw, message.encode("utf-8"))
+            _CryptoKey.from_public_bytes(pub).verify(raw, message)
             theirs = True
         except Exception:
             theirs = False
     return ours, theirs
 
 
+def verify_sig(did: str, message: str, sig: str) -> tuple[bool, bool | None]:
+    """A venue post: `sig` is base64url without padding (86 chars) over the UTF-8 message."""
+    return verify_raw(did, message.encode("utf-8"), b64u_decode(sig))
+
+
+def sig_candidates(body: bytes) -> list[bytes]:
+    """The 64-byte Ed25519 signatures a detached signature file can be read as: 64 raw bytes, or text
+    (optionally a JSON object with a `sig` field, as in the venue's exports) in base64url without
+    padding (the venue's own post encoding), padded base64 or base64url, or multibase base58btc
+    ('z' + base58, the did:key alphabet)."""
+    if len(body) == 64:
+        return [body]
+    try:
+        text = body.decode("ascii").strip()
+    except UnicodeDecodeError:
+        return []
+    if text.startswith("{"):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            return []
+        text = obj.get("sig") if isinstance(obj, dict) else None
+        if not isinstance(text, str):
+            return []
+        text = text.strip()
+    out = []
+    if re.fullmatch(r"[A-Za-z0-9_-]{86}", text):
+        out.append(b64u_decode(text))
+    if re.fullmatch(r"[A-Za-z0-9+/_-]{86}==", text):
+        out.append(base64.b64decode(text.replace("-", "+").replace("_", "/")))
+    if re.fullmatch(r"z[1-9A-HJ-NP-Za-km-z]{80,88}", text):
+        raw = b58decode(text[1:])
+        if len(raw) == 64:
+            out.append(raw)
+    return out
+
+
 # ---------------------------------------------------------------- venue export parsing
 
-def parse_export(body: bytes, room: str, referee: str) -> tuple[list[dict], Counter, list[str]]:
+def parse_export(body: bytes, room: str, referee: str,
+                 rejected: list | None = None) -> tuple[list[dict], Counter, list[str]]:
     """Referee posts from a raw /r/<room>/export body, each signature re-checked over
-    `<room>|<nonce>|<text>` exactly as stored. Nonces are kept as their digits (they may exceed 2^53)."""
+    `<room>|<nonce>|<text>` exactly as stored. Nonces are kept as their digits (they may exceed 2^53).
+    Lines from the referee's DID that are unsigned or fail verification go to `rejected` as (line, reason)."""
     posts, stats, problems = [], Counter(), []
     for lineno, line in enumerate(body.decode("utf-8").splitlines(), 1):
         if not line.strip():
@@ -309,6 +351,8 @@ def parse_export(body: bytes, room: str, referee: str) -> tuple[list[dict], Coun
         nonce, text, sig = rec.get("nonce"), rec.get("text"), rec.get("sig")
         if not sig:
             stats["no signature (not re-verifiable)"] += 1
+            if rejected is not None:
+                rejected.append((rec, "no signature"))
             continue
         ours, theirs = verify_sig(did, f"{room}|{nonce}|{text}", sig)
         if theirs is not None and theirs != ours:
@@ -316,6 +360,8 @@ def parse_export(body: bytes, room: str, referee: str) -> tuple[list[dict], Coun
         if not ours:
             stats["signature FAILED"] += 1
             problems.append(f"{room} seq {rec.get('seq')}: signature does not verify")
+            if rejected is not None:
+                rejected.append((rec, "signature does not verify"))
             continue
         stats["signature verified"] += 1
         try:
@@ -332,6 +378,13 @@ def parse_export(body: bytes, room: str, referee: str) -> tuple[list[dict], Coun
 def owner_from_note(text: str) -> str | None:
     found = DID_RE.findall(text or "")
     return found[0] if len(set(found)) == 1 else None
+
+
+def room_owners() -> dict:
+    """{room: owner DID or None} from the cached room-owners notes."""
+    notes = {r: (VENUE_DIR / f"room-owners_{r}.txt").read_text(encoding="utf-8", errors="replace")
+             for r in (PNL_ROOM, PRICE_ROOM) if (VENUE_DIR / f"room-owners_{r}.txt").exists()}
+    return {r: owner_from_note(t) for r, t in notes.items()}
 
 
 # ---------------------------------------------------------------- stage: fetch
@@ -399,6 +452,28 @@ def cmd_fetch(args) -> int:
 
 # ---------------------------------------------------------------- stage: venue
 
+def load_venue_meta() -> dict:
+    meta_path = VENUE_DIR / "meta.json"
+    return json.loads(meta_path.read_text()) if meta_path.exists() else {}
+
+
+def venue_read(g: Getter, url: str, dest: Path, meta: dict, refresh: bool) -> int:
+    """GET `url` into `dest` once and cache it (re-read with `refresh`). Returns the HTTP status,
+    200 for a cached copy; nothing is written on any other status."""
+    if dest.exists() and dest.stat().st_size and not refresh:
+        log(f"venue: {dest.name} cached ({dest.stat().st_size} bytes, fetched {meta.get(dest.name, {}).get('at')}); not re-read")
+        return 200
+    status, body, headers = g.get(url, timeout=120)
+    if status != 200:
+        log(f"venue: GET {url} -> HTTP {status}")
+        return status
+    write_atomic(dest, body)
+    meta[dest.name] = {"url": url, "at": utc(), "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
+                       "generation": headers.get("X-Room-Generation") or headers.get("x-room-generation")}
+    log(f"venue: {dest.name} {len(body)} bytes")
+    return 200
+
+
 def cmd_venue(args) -> int:
     g = Getter()
     VENUE_DIR.mkdir(parents=True, exist_ok=True)
@@ -406,22 +481,116 @@ def cmd_venue(args) -> int:
              (f"{VENUE}/kv/room-owners/{PRICE_ROOM}", VENUE_DIR / f"room-owners_{PRICE_ROOM}.txt"),
              (f"{VENUE}/r/{PNL_ROOM}/export", VENUE_DIR / f"{PNL_ROOM}.export.jsonl"),
              (f"{VENUE}/r/{PRICE_ROOM}/export", VENUE_DIR / f"{PRICE_ROOM}.export.jsonl")]
-    meta_path = VENUE_DIR / "meta.json"
-    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    meta = load_venue_meta()
     for url, dest in reads:
-        if dest.exists() and dest.stat().st_size and not args.refresh:
-            log(f"venue: {dest.name} cached ({dest.stat().st_size} bytes, fetched {meta.get(dest.name, {}).get('at')}); not re-read")
-            continue
-        status, body, headers = g.get(url, timeout=120)
-        if status != 200:
-            log(f"venue: GET {url} -> HTTP {status}")
+        if venue_read(g, url, dest, meta, args.refresh) != 200:
             return 1
-        write_atomic(dest, body)
-        meta[dest.name] = {"url": url, "at": utc(), "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(),
-                           "generation": headers.get("X-Room-Generation") or headers.get("x-room-generation")}
-        log(f"venue: {dest.name} {len(body)} bytes")
-    dump_json(meta_path, meta)
+    dump_json(VENUE_DIR / "meta.json", meta)
     return 0
+
+
+# ---------------------------------------------------------------- stage: indexsig
+
+def carries_hash(obj, digest: str) -> bool:
+    """True if some string value anywhere in `obj` holds `digest` as a whole hex token."""
+    if isinstance(obj, str):
+        return re.search(rf"(?<![0-9a-f]){digest}(?![0-9a-f])", obj.lower()) is not None
+    if isinstance(obj, dict):
+        return any(carries_hash(v, digest) for k, v in obj.items() if k not in ("_seq", "_ts"))
+    if isinstance(obj, list):
+        return any(carries_hash(v, digest) for v in obj)
+    return False
+
+
+def cmd_indexsig(args) -> int:
+    """Looks for a referee signature over the local records/index.json:
+      form a  a detached signature next to it in the archive (INDEX_SIG_NAMES) over its raw bytes;
+      form b  a referee-signed post in STATE_ROOM or PRICE_ROOM whose JSON text carries the sha256 of
+              those bytes (recomputed here). The room exports are read and cached like the venue stage's.
+    A 404 means "not published". Any published signature that does not verify, or that cannot be
+    read, makes the verdict FAILED; otherwise form a wins over form b. Writes cache/indexsig.json."""
+    path = RECORDS / "index.json"
+    if not path.exists():
+        log("indexsig: records/index.json missing; run fetch first")
+        return 1
+    referee = args.referee or room_owners().get(PNL_ROOM)
+    if not referee:
+        log("indexsig: no referee DID (room-owners note unreadable and no --referee)")
+        return 1
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    g = Getter()
+    verified, failed, notes = [], [], []
+    for name in INDEX_SIG_NAMES:
+        local = RECORDS / name
+        status, body, headers = g.get(f"{ARCHIVE}/{name}", timeout=60)
+        ctype = str(headers.get("Content-Type") or headers.get("content-type") or "")
+        if status in (404, 410) or (status == 200 and ctype.startswith("text/html")):
+            notes.append(f"{name}: not published (HTTP {status}{', an HTML page' if status == 200 else ''})")
+            if local.exists():
+                local.unlink()
+            continue
+        if status != 200:
+            failed.append(f"{name} could not be read: HTTP {status or 'network error'}")
+            continue
+        write_atomic(local, body)
+        cands = sig_candidates(body)
+        if not cands:
+            failed.append(f"{name} is not a recognised Ed25519 signature encoding")
+            continue
+        verdicts = [verify_raw(referee, data, c) for c in cands]
+        if any(theirs is not None and theirs != ours for ours, theirs in verdicts):
+            failed.append(f"{name}: built-in and cryptography Ed25519 disagree")
+        elif any(ours for ours, _ in verdicts):
+            verified.append({"form": "a", "where": f"{ARCHIVE}/{name}"})
+        else:
+            failed.append(f"{name} does not verify over index.json (sha256 {digest}) with the referee key")
+    VENUE_DIR.mkdir(parents=True, exist_ok=True)
+    meta = load_venue_meta()
+    for room in (STATE_ROOM, PRICE_ROOM):
+        dest = VENUE_DIR / f"{room}.export.jsonl"
+        status = venue_read(g, f"{VENUE}/r/{room}/export", dest, meta, args.refresh)
+        if status == 404:
+            notes.append(f"{room}: no export (HTTP 404)")
+            continue
+        if status != 200:
+            failed.append(f"{room} export could not be read: HTTP {status or 'network error'}")
+            continue
+        rejected = []
+        posts, stats, _ = parse_export(dest.read_bytes(), room, referee, rejected)
+        hits = [p for p in posts if carries_hash(p, digest)]
+        verified += [{"form": "b", "where": f"{room} seq {p['_seq']}"} for p in hits]
+        for rec, why in rejected:
+            if digest in str(rec.get("text") or "").lower():
+                failed.append(f"{room} seq {rec.get('seq')} carries the index sha256 but has {why}"
+                              if why == "no signature" else
+                              f"{room} seq {rec.get('seq')} carries the index sha256 but its {why}")
+        notes.append(f"{room}: {stats.get('signature verified', 0)} referee posts verified, "
+                     f"{len(hits)} carry the index sha256")
+    dump_json(VENUE_DIR / "meta.json", meta)
+    if failed:
+        line = f"index signature: FAILED ({failed[0]}" + (f"; {len(failed) - 1} more" if len(failed) > 1 else "") + ")"
+    elif any(v["form"] == "a" for v in verified):
+        line = "index signature: verified (form a)"
+    elif verified:
+        line = "index signature: verified (form b)"
+    else:
+        line = "index signature: none published"
+    dump_json(CACHE / "indexsig.json", {"at": utc(), "index_sha256": digest, "referee": referee, "line": line,
+                                        "verified": verified, "failed": failed, "notes": notes,
+                                        "requests": g.requests})
+    log(f"indexsig: {line}; {'; '.join(notes)}; {g.requests} requests")
+    return 0
+
+
+def index_sig_line() -> str:
+    path = CACHE / "indexsig.json"
+    if not path.exists():
+        return "index signature: not checked (run the indexsig stage)"
+    isig = json.loads(path.read_text())
+    if not (RECORDS / "index.json").exists() or isig.get("index_sha256") != sha256_file(RECORDS / "index.json"):
+        return "index signature: not checked for the current index.json (rerun the indexsig stage)"
+    return isig["line"]
 
 
 # ---------------------------------------------------------------- stage: verify
@@ -484,9 +653,7 @@ def cmd_verify(args) -> int:
     if cached(CACHE / "verify.json", fp, args.force):
         log("verify: inputs unchanged since the last run; reusing cache/verify.json (--force to redo)")
         return 0
-    notes = {r: (VENUE_DIR / f"room-owners_{r}.txt").read_text(encoding="utf-8", errors="replace")
-             for r in (PNL_ROOM, PRICE_ROOM) if (VENUE_DIR / f"room-owners_{r}.txt").exists()}
-    owners = {r: owner_from_note(t) for r, t in notes.items()}
+    owners = room_owners()
     referee = args.referee or owners.get(PNL_ROOM)
     if not referee:
         log("verify: no referee DID (room-owners note unreadable and no --referee)")
@@ -852,6 +1019,8 @@ def cmd_report(args) -> int:
         w(f"- Seed post pins package `{sd['package']}`; local `close-call/manifest.json` sha256 `{sd['manifest_sha256']}` "
           f"({'match' if sd['package'] == sd['manifest_sha256'] else 'DIFFERENT'}).")
     w("")
+    w(index_sig_line())
+    w("")
     w("## Record hashes\n")
     fb = [r["n"] for r in full if not str(r.get("hash", "")).startswith("ok")]
     rb = [r["n"] for r in red if not str(r.get("hash", "")).startswith("ok")]
@@ -989,7 +1158,8 @@ def cmd_all(args) -> int:
         common += ["--asof", str(args.asof)]
     if args.force:
         common += ["--force"]
-    steps = [[] if args.skip_fetch else ["fetch"], ["venue"] + (["--refresh"] if args.refresh else []),
+    refresh = ["--refresh"] if args.refresh else []
+    steps = [[] if args.skip_fetch else ["fetch"], ["venue"] + refresh, ["indexsig"] + refresh,
              ["nice", "verify"], ["nice", "replay"], ["report"]]
     for step in steps:
         if not step:
@@ -1009,18 +1179,18 @@ def cmd_all(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["fetch", "venue", "verify", "replay", "report", "all"])
+    ap.add_argument("stage", choices=["fetch", "venue", "indexsig", "verify", "replay", "report", "all"])
     ap.add_argument("--repo", type=Path, default=DEFAULT_REPO, help="contest repo checkout (default ../close-call)")
     ap.add_argument("--referee", help="referee did:key (default: the venue's room-owners note for d-close1-pnl)")
     ap.add_argument("--asof", type=int, help="stop the replay at this sweep")
     ap.add_argument("--every", type=int, default=25, help="progress line every N records/sweeps")
-    ap.add_argument("--refresh", action="store_true", help="venue: re-read the exports and notes")
+    ap.add_argument("--refresh", action="store_true", help="venue, indexsig: re-read the exports and notes")
     ap.add_argument("--skip-fetch", action="store_true", help="all: do not touch the archive")
     ap.add_argument("--force", action="store_true", help="verify/replay: redo even if the inputs are unchanged")
     args = ap.parse_args()
     args.repo = args.repo.expanduser().resolve()
-    return {"fetch": cmd_fetch, "venue": cmd_venue, "verify": cmd_verify, "replay": cmd_replay,
-            "report": cmd_report, "all": cmd_all}[args.stage](args)
+    return {"fetch": cmd_fetch, "venue": cmd_venue, "indexsig": cmd_indexsig, "verify": cmd_verify,
+            "replay": cmd_replay, "report": cmd_report, "all": cmd_all}[args.stage](args)
 
 
 if __name__ == "__main__":
