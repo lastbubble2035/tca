@@ -6,8 +6,17 @@ issues only HTTP GETs. It reads no private keys, local archives or databases.
 
 ## Run
 
+From the repository root (Python 3.10+):
+
 ```sh
-cd ~/Desktop/RV && /opt/homebrew/bin/python3 verify/close1_verify_public.py all
+python3 verify/close1_verify_public.py all
+```
+
+If your checkout of the close-call contest repo is somewhere other than `close-call/` in the
+repository root, point `--repo` at it (or set `CLOSE_CALL_REPO`):
+
+```sh
+python3 verify/close1_verify_public.py all --repo /path/to/technocore-close-call-challenge
 ```
 
 That fetches (or resumes) the archive, verifies, replays under `nice -n 19` and writes
@@ -22,7 +31,7 @@ cross-check the Ed25519 verifier) and a checkout of the contest package next to 
 <https://github.com/flop-labs/technocore-close-call-challenge>.
 
 Tests (synthetic fixtures, no network):
-`/opt/homebrew/bin/python3 -m unittest discover -s verify/tests -v`
+`python3 -m unittest discover -s verify/tests -v` (from the repository root)
 
 ## Data sources
 
@@ -90,3 +99,8 @@ rooms are on `technocore.chat`, whose published limits are 600 reads and 300 wri
 - `cache/`: `events.jsonl` (fold input), `expected.jsonl`, `verify.json`, `replay.json`, `fetch.json`.
 - `REPORT.md`, `sweeps.csv` (per-sweep hashes, redactions, matches, board classes), `progress.log`.
 - `tests/test_verify_public.py`: offline tests.
+
+`records/`, `venue/`, `cache/` and `progress.log` are generated on the first run and are not part of the published folder.
+
+`records/`, `venue/`, `cache/` and `progress.log` are generated on first run and are not part of
+the published folder.

@@ -1,6 +1,6 @@
 """Offline tests for close1_verify_public.py on tiny synthetic fixtures. No network, nothing outside verify/.
 
-    /opt/homebrew/bin/python3 -m unittest discover -s verify/tests -v
+    python3 -m unittest discover -s verify/tests -v
 """
 from __future__ import annotations
 
