@@ -16,7 +16,15 @@ Stages (run them all with `all`):
            sha256 of every record; redacted trades per sweep; builds the fold input in verify/cache/.
   replay   Runs close-call/close_call_fold.py (imported by path, unmodified) over the cached input,
            redacted trades skipped, and compares every sweep with the records and the signed boards.
-  report   Writes verify/REPORT.md and verify/sweeps.csv.
+  final-record  Streams the three parts of the official final record (GET only), checks the sha256 of
+           the decompressed JSON, and checks the first three scores as exact decimal strings. It does
+           not read a key directory. An optional --dids file is a local tally only and is not used
+           by report.
+  report   Writes verify/REPORT.md and verify/sweeps.csv. When the official final record verifies,
+           the Final standings section is that record's top 3, cited as the signed d-close1-pnl
+           post #2557 (t=standings, no sweep number). Otherwise the section is that post, or the
+           earliest signed pnl post at or after settlement, and it says the board is not yet
+           available until one of those is in hand. --refresh re-reads the venue exports first.
 
 Nothing here writes to the network: every request is an HTTP GET. Standard library only (the
 `cryptography` package, if installed, is used to cross-check the built-in Ed25519 verifier).
@@ -26,8 +34,10 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import gzip
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import random
@@ -37,7 +47,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from collections import Counter
+from datetime import datetime
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from pathlib import Path
 
@@ -60,6 +72,18 @@ CENT = Decimal("0.01")
 PATH_RE = re.compile(r"(sweeps|redacted)/[0-9a-f]{64}\.json")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 DID_RE = re.compile(r"did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}")
+FINAL_URL = "https://challenges.technocore.chat/close-1/final/"
+FINAL_PART_NAMES = (
+    "final-record.json.gz.part-00",
+    "final-record.json.gz.part-01",
+    "final-record.json.gz.part-02",
+)
+FINAL_SHA256 = "b642411aac2a3e336e97ee19aac9228d5d249b76bd41a56d4535f8be3d2f9d27"
+FINAL_TOP_SCORES = ("1576.916300", "1424.740300", "1337.545600")
+FINAL_STANDINGS_SEQ = 2557
+FINAL_STANDINGS_TS = "2026-10-04T17:33:04Z"
+_NUM = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?")
+_SIDE_QTY = {"side", "qty", "quantity", "position"}
 
 
 # ---------------------------------------------------------------- small utilities
@@ -595,11 +619,20 @@ def index_sig_line() -> str:
 
 # ---------------------------------------------------------------- stage: verify
 
-def pnl_posts(referee: str) -> tuple[dict, Counter, list, list]:
+def pnl_posts(referee: str) -> tuple[dict, Counter, list, list, dict | None]:
+    """(pnl posts by sweep, stats, problems, duplicate sweeps, the t=standings post or None).
+
+    The standings post is the final board. It has no sweep number, so it is not entered in by_n.
+    If several verify, the one with the greatest seq is kept."""
     body = (VENUE_DIR / f"{PNL_ROOM}.export.jsonl").read_bytes()
     posts, stats, problems = parse_export(body, PNL_ROOM, referee)
-    by_n, dup = {}, []
+    by_n, dup, standings = {}, [], None
     for p in posts:
+        if p.get("t") == "standings":
+            stats["standings"] += 1
+            if standings is None or (p.get("_seq") or 0) >= (standings.get("_seq") or 0):
+                standings = p
+            continue
         if p.get("t") != "pnl" or type(p.get("n")) is not int:
             stats["verified, not a pnl post"] += 1
             continue
@@ -607,7 +640,7 @@ def pnl_posts(referee: str) -> tuple[dict, Counter, list, list]:
             dup.append(p["n"])
             continue
         by_n[p["n"]] = p
-    return by_n, stats, problems, dup
+    return by_n, stats, problems, dup, standings
 
 
 def seed_post(referee: str) -> tuple[dict | None, Counter, list]:
@@ -648,8 +681,107 @@ def cached(path: Path, fp: str, force: bool) -> bool:
         return False
 
 
+def load_contest(repo: Path) -> dict:
+    path = repo / "contest.json"
+    if not path.exists():
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def settlement_sweep(contest: dict) -> int | None:
+    """Sweep whose clock is `final_price_time`.
+
+    time(n) = first_sweep + (n - 1) * sweep_seconds. That is the sweep at which the rules say
+    the referee posts the settlement price S (one hour after the lock). None if the contest
+    document does not carry those fields."""
+    try:
+        t0 = datetime.fromisoformat(str(contest["first_sweep"]).replace("Z", "+00:00"))
+        tf = datetime.fromisoformat(str(contest["final_price_time"]).replace("Z", "+00:00"))
+        step = int(contest["sweep_seconds"])
+        if step <= 0:
+            return None
+        delta = (tf - t0).total_seconds()
+        if delta < 0:
+            return None
+        return int(delta // step) + 1
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+
+def board_from_standings(post: dict | None) -> dict | None:
+    """The signed t=standings post as a board.
+
+    That post has S and places and does not carry a sweep number. places are the prize rows
+    ([key, score, places spanned, sharing]); next, when present, continues the board in order.
+    A post that also carries n is accepted and keeps it. None if this is not that post."""
+    if not isinstance(post, dict) or post.get("t") != "standings":
+        return None
+    s = post.get("S")
+    if not isinstance(s, str):
+        return None
+    top = []
+    for key in ("places", "next"):
+        block = post.get(key)
+        if not isinstance(block, list):
+            continue
+        for row in block:
+            if (isinstance(row, (list, tuple)) and len(row) >= 2
+                    and isinstance(row[0], str) and isinstance(row[1], str)):
+                top.append([row[0], row[1]])
+    if not top:
+        return None
+    board = {"t": "standings", "mark": s, "S": s, "top": top}
+    if type(post.get("n")) is int:
+        board["n"] = post["n"]
+    if post.get("_ts"):
+        board["ts"] = post["_ts"]
+    if post.get("_seq") is not None:
+        board["seq"] = post["_seq"]
+    return board
+
+
+def venue_standings_post() -> dict | None:
+    """The signed t=standings post in the cached d-close1-pnl export, or None.
+
+    That post has no sweep number. The greatest seq wins when several verify."""
+    path = VENUE_DIR / f"{PNL_ROOM}.export.jsonl"
+    if not path.is_file():
+        return None
+    referee = room_owners().get(PNL_ROOM)
+    if not referee:
+        return None
+    try:
+        _by_n, _stats, _problems, _dup, standings = pnl_posts(referee)
+    except (OSError, ValueError):
+        return None
+    return standings
+
+
+def select_final_board(by_n: dict, settlement_n: int | None, standings: dict | None = None) -> dict | None:
+    """The signed t=standings post if one was published (it need not have a sweep number).
+
+    Otherwise the earliest signed pnl post at or after the settlement sweep, or None if
+    neither is available. A pnl post that still carries n is unchanged."""
+    board = board_from_standings(standings)
+    if board is not None:
+        return board
+    if settlement_n is None:
+        return None
+    candidates = [n for n in by_n if type(n) is int and n >= settlement_n]
+    if not candidates:
+        return None
+    n = min(candidates)
+    post = by_n[n]
+    top = post.get("top") if isinstance(post.get("top"), list) else []
+    return {"n": n, "mark": post.get("mark"), "top": top}
+
+
 def cmd_verify(args) -> int:
-    fp = fingerprint(args)
+    fp = fingerprint(args, args.repo / "contest.json")
     if cached(CACHE / "verify.json", fp, args.force):
         log("verify: inputs unchanged since the last run; reusing cache/verify.json (--force to redo)")
         return 0
@@ -658,7 +790,7 @@ def cmd_verify(args) -> int:
     if not referee:
         log("verify: no referee DID (room-owners note unreadable and no --referee)")
         return 1
-    by_n, pstats, problems, dup = pnl_posts(referee)
+    by_n, pstats, problems, dup, standings = pnl_posts(referee)
     seed, sstats, sproblems = seed_post(referee)
     idx = load_index()
     sweeps = sorted(idx["sweeps"], key=lambda e: e["n"])
@@ -750,9 +882,15 @@ def cmd_verify(args) -> int:
 
     manifest_sha = hashlib.sha256((args.repo / "manifest.json").read_bytes()).hexdigest() \
         if (args.repo / "manifest.json").exists() else None
+    contest = load_contest(args.repo)
+    settle_n = settlement_sweep(contest)
+    final_board = select_final_board(by_n, settle_n, standings)
     result = {
         "at": utc(), "fingerprint": fp, "referee": referee, "referee_source": {r: owners.get(r) for r in owners},
         "referee_override": bool(args.referee), "asof": asof, "records_contiguous_to_asof": contiguous,
+        "lock_sweep": contest.get("lock_sweep"), "lock_time": contest.get("lock"),
+        "settlement_sweep": settle_n, "final_price_time": contest.get("final_price_time"),
+        "final_board": final_board,
         "index_sweeps": [have[0], have[-1]], "index_sha256": sha256_file(RECORDS / "index.json"),
         "pnl": {"posts": len(by_n), "range": [min(by_n), max(by_n)], "duplicates": dup, "stats": dict(pstats),
                 "problems": problems},
@@ -816,7 +954,8 @@ def board_check(fold, board: dict) -> tuple[dict, bool, list]:
             continue
         base, q = acct.value_at(Decimal(0)) - fold.mint, acct.position
         score = base + q * g_used
-        if g_ok and cents(score) == p:
+        # Posted pnl scores are cents. A standings score is the same number to 6 dp; compare at the cent.
+        if g_ok and cents(score) == cents(p):
             status, iv = "exact", (g, g)
         else:
             if q == 0:
@@ -830,6 +969,42 @@ def board_check(fold, board: dict) -> tuple[dict, bool, list]:
             common = [max(common[0], iv[0]), min(common[1], iv[1])]
         out[k] = (status, score, p)
     return out, g_ok, common
+
+
+def build_final_standings(fold, ver: dict) -> dict:
+    """Top 3 of the final board, classified with board_check.
+
+    The board is the signed t=standings post when the venue export has one (it has no sweep
+    number). Otherwise it is a signed pnl post at or after the settlement sweep. Available only
+    once the replay's as-of sweep covers the lock and one of those posts is present."""
+    lock, settle, asof = ver.get("lock_sweep"), ver.get("settlement_sweep"), ver.get("asof")
+    board = ver.get("final_board")
+    out = {"available": False, "lock_sweep": lock, "settlement_sweep": settle, "asof": asof,
+           "sweep": None, "mark": None, "source": None, "rows": []}
+    covers = type(asof) is int and type(lock) is int and asof >= lock
+    is_standings = (isinstance(board, dict) and board.get("t") == "standings"
+                    and isinstance(board.get("mark"), str) and isinstance(board.get("top"), list))
+    has_sweep = (isinstance(board, dict) and type(board.get("n")) is int and type(settle) is int
+                 and board["n"] >= settle and isinstance(board.get("mark"), str))
+    if not covers or not (is_standings or has_sweep):
+        return out
+    checked, g_ok, common = board_check(fold, board)
+    six = Decimal("0.000001")
+    rows = []
+    for rank, (k, posted_score) in enumerate(board.get("top") or [], 1):
+        if rank > 3:
+            break
+        status, score, p = checked[k]
+        rows.append({"rank": rank, "key": k, "posted": posted_score,
+                     "fold": str(score.quantize(six)) if score is not None else None,
+                     "status": status, "reproducible": status != "off",
+                     "delta": str((score - p).quantize(six)) if score is not None else None})
+    out.update(available=True, sweep=board["n"] if type(board.get("n")) is int else None,
+               mark=board.get("mark"), source="standings" if is_standings else "pnl",
+               ts=board.get("ts"),
+               fold_global_rounds_to_mark=g_ok,
+               common_interval=[str(x) for x in common], rows=rows)
+    return out
 
 
 def cmd_replay(args) -> int:
@@ -922,6 +1097,7 @@ def cmd_replay(args) -> int:
             if n % args.every == 0 or n == asof:
                 log(f"replay: sweep {n}/{asof}; visible trades {tally['visible trades']}, "
                     f"matched {tally['matched']}, mismatched {tally['mismatched']} ({time.monotonic() - t0:.0f}s)")
+        final_standings = build_final_standings(fold, ver)
     table = []
     six = Decimal("0.000001")
     for rank, (k, posted) in enumerate(ver["board_asof"], 1):
@@ -954,6 +1130,7 @@ def cmd_replay(args) -> int:
         "per_sweep": per_sweep, "table": table,
         "asof_global": {"fold_global_rounds_to_mark": last_g_ok, "common_interval": [str(x) for x in last_common],
                         "common_ok": last_common[0] <= last_common[1]},
+        "final_standings": final_standings,
         "final": {k: v for k, v in final.items() if k != "standings"},
         "final_top": final["standings"][:40], "elapsed_s": round(time.monotonic() - t0, 1)})
     log(f"replay: done in {time.monotonic() - t0:.0f}s; {dict(tally)}; board reproducible "
@@ -963,7 +1140,127 @@ def cmd_replay(args) -> int:
 
 # ---------------------------------------------------------------- stage: report
 
+def verified_final_record() -> dict | None:
+    """The cached final-record result when its decompressed sha256 is the official digest."""
+    path = CACHE / "final-record.json"
+    if not path.is_file():
+        return None
+    try:
+        rec = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if (rec.get("sha256_ok") and rec.get("sha256") == FINAL_SHA256 and rec.get("top3_ok")
+            and isinstance(rec.get("top3"), list) and rec["top3"]):
+        return rec
+    return None
+
+
+def _places_text(value) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(x) for x in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _top3_with_places(rec: dict) -> list[dict]:
+    """Top 3 from the verified record. Places are filled from the cached parts when absent."""
+    rows = [dict(r) for r in rec["top3"][:3]]
+    if rows and all("places" in r for r in rows):
+        return rows
+    paths = final_part_paths(CACHE / "final-record")
+    if not all(p.is_file() for p in paths):
+        return rows
+    text = open_final_text(paths)
+    try:
+        for i, obj in enumerate(iter_json_array(text), 1):
+            if i > len(rows):
+                break
+            if isinstance(obj.get("places"), list):
+                rows[i - 1]["places"] = obj["places"]
+            if i == 3:
+                break
+    finally:
+        text.close()
+    return rows
+
+
+def final_standings_lines(ver: dict, rep: dict | None, standings_post: dict | None = None,
+                          final_record: dict | None = None) -> list[str]:
+    """Markdown for the Final standings section.
+
+    When the official final record's decompressed sha256 matches, the board is that record's
+    top 3, cited as d-close1-pnl #2557. Otherwise the board is the signed t=standings post
+    once a replay has classified it (or, if it is absent, a signed pnl post at or after the
+    settlement sweep). Until then the section says the board is not yet available."""
+    fs = (rep or {}).get("final_standings") or {
+        "available": False, "lock_sweep": ver.get("lock_sweep"), "settlement_sweep": ver.get("settlement_sweep"),
+        "asof": ver.get("asof"), "rows": []}
+    lock, settle, asof = fs.get("lock_sweep"), fs.get("settlement_sweep"), fs.get("asof")
+    when = ver.get("final_price_time") or "final_price_time"
+    lines = ["## Final standings\n"]
+    lines.append(
+        f"The lock is sweep {lock}"
+        + (f" ({ver.get('lock_time')})" if ver.get("lock_time") else "")
+        + f". Settlement is sweep {settle}, the sweep whose clock is `{when}`: the referee posts "
+        f"the settlement price *S* then, and open contracts settle at it. The final board is the "
+        f"signed `{PNL_ROOM}` post with `t` = `standings` (that post has no sweep number). If it "
+        f"has not been published, the final board is the earliest signed pnl post at or after "
+        f"sweep {settle}. Each of its top 3 keys is checked with the same cent and mark-rounding "
+        f"rule as the top 25.\n")
+    rec = final_record if (isinstance(final_record, dict) and final_record.get("sha256_ok")
+                           and final_record.get("sha256") == FINAL_SHA256 and final_record.get("top3_ok")
+                           and isinstance(final_record.get("top3"), list) and final_record["top3"]) else None
+    if rec is not None:
+        lines.append(
+            f"The official final record verifies (decompressed sha256 `{rec['sha256']}`). "
+            f"Its top 3 are the final board, the signed `{PNL_ROOM}` #{FINAL_STANDINGS_SEQ} "
+            f"(`t` = `standings`, {FINAL_STANDINGS_TS}).\n")
+        if isinstance(standings_post, dict) and standings_post.get("t") == "standings":
+            seq, ts, s = standings_post.get("_seq"), standings_post.get("_ts"), standings_post.get("S")
+            lines.append(
+                f"Venue export: `{PNL_ROOM}` seq {seq} at {ts}, `t` = `standings`"
+                + (f", S `{s}`" if isinstance(s, str) else "")
+                + ".\n")
+        lines.append("| # | key prefix | score | places | fee |")
+        lines.append("|---:|---|---:|---|---:|")
+        for row in _top3_with_places(rec):
+            lines.append(f"| {row.get('rank')} | `{row.get('prefix')}` | {row.get('score')} | "
+                         f"{_places_text(row.get('places'))} | {row.get('fee', '')} |")
+        lines.append("")
+        return lines
+    if not fs.get("available"):
+        if type(asof) is int and type(lock) is int and asof < lock:
+            why = f"this run's as-of sweep is {asof}, before the lock at sweep {lock}"
+        else:
+            why = (f"no signed post with t=standings, and no signed pnl post at or after "
+                   f"sweep {settle}, is in the venue export")
+        lines.append(f"**not yet available** — {why}.\n")
+        return lines
+    if fs.get("source") == "standings":
+        when_ts = f" at {fs['ts']}" if fs.get("ts") else ""
+        nbit = (f", sweep {fs['sweep']}" if type(fs.get("sweep")) is int else ", no sweep number")
+        lines.append(f"Signed post `t` = `standings`{when_ts}{nbit}, S `{fs.get('mark')}`.\n")
+    else:
+        lines.append(f"Signed pnl post at sweep {fs.get('sweep')} (settlement sweep {settle}), mark `{fs.get('mark')}`.\n")
+    lines.append("| # | key | posted | replay | reproduces | class |")
+    lines.append("|---|---|---:|---:|---|---|")
+    klass = {"exact": "exact", "consistent": "mark rounding", "off": "off"}
+    for r in fs.get("rows") or []:
+        word = "reproduced" if r.get("reproducible") else "not reproduced"
+        fold = r["fold"] if r.get("fold") is not None else "not minted"
+        lines.append(f"| {r['rank']} | `{r['key']}` | {r['posted']} | {fold} | {word} | "
+                     f"{klass.get(r.get('status'), r.get('status'))} |")
+    lines.append("")
+    return lines
+
+
 def cmd_report(args) -> int:
+    if getattr(args, "refresh", False):
+        log("report: --refresh re-reading the venue")
+        code = cmd_venue(args)
+        if code:
+            return code
     ver = json.loads((CACHE / "verify.json").read_text())
     rep = json.loads((CACHE / "replay.json").read_text()) if (CACHE / "replay.json").exists() else None
     fetch = json.loads((CACHE / "fetch.json").read_text()) if (CACHE / "fetch.json").exists() else {}
@@ -1120,6 +1417,13 @@ def cmd_report(args) -> int:
             w("")
     else:
         w("## Replay\n\nNot run.\n")
+    seen = venue_standings_post()
+    if seen:
+        log(f"report: venue standings post seq {seen.get('_seq')} at {seen.get('_ts')}")
+    for line in final_standings_lines(ver, rep, seen, verified_final_record()):
+        w(line)
+    for line in final_record_lines():
+        w(line)
     w("## What could not be verified\n")
     w("- The content of redacted trades (keys, terms, outcomes) and therefore any board score they move.")
     w("- Authenticity of redacted records beyond the unsigned index hash (see Record hashes).")
@@ -1148,6 +1452,470 @@ def cmd_report(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- stage: final-record
+
+def refuse_keys(path: Path) -> Path:
+    """Stop if `path` is ~/.tc-close1-keys or anything inside it. Does not list that directory."""
+    path = Path(path).expanduser()
+    keys = Path(os.environ.get("CLOSE1_KEYS", "~/.tc-close1-keys")).expanduser()
+    try:
+        resolved = path.resolve()
+        keys_r = keys.resolve()
+    except OSError:
+        resolved, keys_r = path, keys
+    if resolved == keys_r or keys_r in resolved.parents:
+        raise SystemExit("refusing a path under ~/.tc-close1-keys")
+    return path
+
+
+def sha256_concat(paths: list[Path]) -> str:
+    h = hashlib.sha256()
+    for path in paths:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_decompressed(paths: list[Path]) -> tuple[str, int | None]:
+    """(sha256, byte count) of the gunzip of the concatenated parts.
+
+    The count is None when the gzip stream is invalid. Bytes are hashed as they decompress.
+    """
+    h = hashlib.sha256()
+    total = 0
+    raw = io.BufferedReader(_PartReader(paths), buffer_size=1 << 20)
+    try:
+        gz = gzip.GzipFile(fileobj=raw)
+    except gzip.BadGzipFile:
+        raw.close()
+        return h.hexdigest(), None
+    try:
+        while True:
+            try:
+                chunk = gz.read(1 << 20)
+            except (gzip.BadGzipFile, EOFError, zlib.error):
+                return h.hexdigest(), None
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+    finally:
+        gz.close()
+    return h.hexdigest(), total
+
+
+class _PartReader(io.RawIOBase):
+    """Read several files as one byte stream."""
+
+    def __init__(self, paths: list[Path]):
+        self._fh = [open(p, "rb") for p in paths]
+        self._i = 0
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        n = 0
+        mv = memoryview(b)
+        while n < len(mv) and self._i < len(self._fh):
+            got = self._fh[self._i].readinto(mv[n:])
+            if not got:
+                self._fh[self._i].close()
+                self._i += 1
+                continue
+            n += got
+        return n
+
+    def close(self) -> None:
+        for fh in self._fh:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        super().close()
+
+
+def open_final_text(paths: list[Path]):
+    """Stream-decompress the concatenation of the part files. One gzip member."""
+    raw = io.BufferedReader(_PartReader(paths), buffer_size=1 << 20)
+    gz = gzip.GzipFile(fileobj=raw)
+    return io.TextIOWrapper(gz, encoding="utf-8", newline="")
+
+
+def iter_json_array(stream):
+    """Yield row objects. Numbers stay the exact decimal text, not floats.
+
+    A top-level array is that array. Any other document is scanned, outside strings, for the first
+    array whose first element is an object (the standings list in the official record).
+    """
+    dec = json.JSONDecoder(parse_float=str, parse_int=str)
+    buf, pos, eof = "", 0, False
+    in_str, esc = False, False
+    while True:
+        if pos >= len(buf) and not eof:
+            chunk = stream.read(1 << 20)
+            if chunk:
+                buf += chunk
+            else:
+                eof = True
+        if pos >= len(buf):
+            raise ValueError("final record has no row array")
+        ch = buf[pos]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            pos += 1
+            continue
+        if ch == '"':
+            in_str = True
+            pos += 1
+            continue
+        if ch == "[":
+            q = pos + 1
+            while True:
+                while q >= len(buf) and not eof:
+                    chunk = stream.read(1 << 20)
+                    if chunk:
+                        buf += chunk
+                    else:
+                        eof = True
+                if q >= len(buf):
+                    raise ValueError("final record row array is truncated")
+                if buf[q] in " \t\r\n":
+                    q += 1
+                    continue
+                break
+            if buf[q] == "{":
+                pos += 1
+                break
+        pos += 1
+    while True:
+        while pos < len(buf) and buf[pos] in " \t\r\n":
+            pos += 1
+        if pos >= len(buf):
+            if eof:
+                raise ValueError("final record JSON array did not end")
+            chunk = stream.read(1 << 20)
+            if chunk:
+                buf += chunk
+            else:
+                eof = True
+            continue
+        ch = buf[pos]
+        if ch == "]":
+            return
+        if ch == ",":
+            pos += 1
+            continue
+        try:
+            obj, end = dec.raw_decode(buf, pos)
+        except json.JSONDecodeError:
+            if eof:
+                raise
+            chunk = stream.read(1 << 20)
+            if not chunk:
+                eof = True
+            else:
+                buf += chunk
+            continue
+        if not isinstance(obj, dict):
+            raise ValueError("final record row is not an object")
+        yield obj
+        pos = end
+        if pos > (1 << 20):
+            buf = buf[pos:]
+            pos = 0
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, str) and _NUM.fullmatch(v) is not None
+
+
+def pick_key_field(obj: dict) -> str | None:
+    hits = [k for k, v in obj.items() if isinstance(v, str) and v.startswith("did:key:")]
+    for name in ("key", "did", "account", "owner"):
+        if name in hits:
+            return name
+    return hits[0] if hits else None
+
+
+def pick_score_field(obj: dict, expect0: str) -> str | None:
+    """The field whose text is the first expected score, else a numeric score/pnl/value field."""
+    hits = [k for k, v in obj.items() if isinstance(v, str) and v == expect0]
+    if len(hits) == 1:
+        return hits[0]
+    named = [k for k in hits if any(s in k.lower() for s in ("score", "pnl", "value"))]
+    if named:
+        return named[0]
+    if hits:
+        return hits[0]
+    for name in ("score", "pnl", "value"):
+        if _is_num(obj.get(name)):
+            return name
+    named2 = [k for k, v in obj.items() if _is_num(v) and any(s in k.lower() for s in ("score", "pnl"))]
+    return named2[0] if len(named2) == 1 else None
+
+
+def pick_fee_field(obj: dict) -> str | None:
+    for name in ("fee", "fees"):
+        if name in obj and _is_num(obj[name]):
+            return name
+    cands = [k for k, v in obj.items() if "fee" in k.lower() and _is_num(v)]
+    return cands[0] if len(cands) == 1 else None
+
+
+def pick_side_qty(obj: dict, skip: set[str]) -> list[str]:
+    out = []
+    for k, v in obj.items():
+        if k in skip:
+            continue
+        if v is not None and not isinstance(v, (str, int, float)):
+            continue
+        low = k.lower()
+        if low in _SIDE_QTY or low.endswith("_qty") or low.endswith("_side"):
+            out.append(k)
+    return out
+
+
+def key_prefix(did: str, n: int = 12) -> str:
+    body = did[len("did:key:"):] if did.startswith("did:key:") else did
+    return body[:n]
+
+
+def load_did_list(path: Path) -> set[str]:
+    path = refuse_keys(path)
+    out = set()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("did:key:"):
+                out.add(s)
+    return out
+
+
+def final_part_paths(directory: Path) -> list[Path]:
+    return [directory / name for name in FINAL_PART_NAMES]
+
+
+def ensure_final_parts(directory: Path) -> list[Path] | None:
+    """Stream each part to disk. A part already present is kept; the hash is what accepts it."""
+    directory.mkdir(parents=True, exist_ok=True)
+    g = Getter()
+    paths = []
+    for name in FINAL_PART_NAMES:
+        dest = directory / name
+        if dest.is_file() and dest.stat().st_size > 0:
+            log(f"final-record: using {dest.name} ({dest.stat().st_size} bytes)")
+            paths.append(dest)
+            continue
+        url = FINAL_URL + name
+        log(f"final-record: GET {url}")
+        status, _body, _headers = g.get(url, dest=dest, timeout=600)
+        if status != 200 or not dest.is_file() or dest.stat().st_size == 0:
+            log(f"final-record: GET {url} -> {status}")
+            return None
+        paths.append(dest)
+    return paths
+
+
+def _row_view(obj: dict, key_f: str, score_f: str, fee_f: str | None, extras: list[str], rank: int) -> dict:
+    did = obj.get(key_f)
+    row = {"rank": rank, "prefix": key_prefix(did) if isinstance(did, str) else "",
+           "score": obj.get(score_f)}
+    if fee_f:
+        row["fee"] = obj.get(fee_f)
+    for name in extras:
+        if name in obj:
+            row[name] = obj[name]
+    row["key"] = did
+    if isinstance(obj.get("places"), list):
+        row["places"] = obj["places"]
+    return row
+
+
+def cmd_final_record(args) -> int:
+    """Hash the decompressed JSON, then stream the rows. Optional --dids tallies a caller-supplied list.
+
+    The published result (verify/cache/final-record.json and the report) has prefixes and scores
+    only. Full DIDs from --dids are written to --ours-out and are not put in the report."""
+    expect_sha = getattr(args, "expect_sha256", None) or FINAL_SHA256
+    raw_scores = getattr(args, "expect_scores", None)
+    expect_scores = tuple(s.strip() for s in raw_scores.split(",")) if raw_scores else FINAL_TOP_SCORES
+    if len(expect_scores) != 3:
+        log("final-record: --expect-scores needs three comma-separated decimals")
+        return 1
+    parts_dir = getattr(args, "parts_dir", None)
+    if parts_dir:
+        directory = refuse_keys(Path(parts_dir))
+        paths = final_part_paths(directory)
+        missing = [p.name for p in paths if not p.is_file()]
+        if missing:
+            log(f"final-record: missing {missing} in {directory}")
+            return 1
+    else:
+        paths = ensure_final_parts(CACHE / "final-record")
+        if not paths:
+            return 1
+    digest, nbytes = sha256_decompressed(paths)
+    gzip_sha = sha256_concat(paths)
+    result = {"at": utc(), "url": FINAL_URL, "parts": list(FINAL_PART_NAMES),
+              "sha256": digest, "sha256_of": "decompressed", "expect_sha256": expect_sha,
+              "sha256_ok": nbytes is not None and digest == expect_sha,
+              "decompressed_bytes": nbytes, "gzip_sha256": gzip_sha,
+              "part_bytes": [p.stat().st_size for p in paths]}
+    if nbytes is None or digest != expect_sha:
+        why = "gzip decompress failed" if nbytes is None else f"got {digest} expected {expect_sha}"
+        log(f"final-record: decompressed sha256 MISMATCH ({why})")
+        dump_json(CACHE / "final-record.json", result)
+        return 1
+    log(f"final-record: decompressed sha256 {digest} matches ({nbytes} bytes)")
+    want = None
+    dids = getattr(args, "dids", None)
+    if dids:
+        want = load_did_list(Path(dids))
+        log(f"final-record: tallying {len(want)} public dids from {Path(dids).name}")
+    ours_out = getattr(args, "ours_out", None)
+    if ours_out:
+        ours_out = refuse_keys(Path(ours_out))
+    text = open_final_text(paths)
+    top3 = []
+    key_f = score_f = fee_f = None
+    extras: list[str] = []
+    rows_n = 0
+    matched = 0
+    seen: set[str] = set()
+    sum_score = Decimal(0)
+    sum_fee = Decimal(0)
+    n_pos = n_neg = n_zero = 0
+    best = None
+    writer = None
+    csv_fh = None
+    try:
+        for obj in iter_json_array(text):
+            rows_n += 1
+            if rows_n == 1:
+                key_f = pick_key_field(obj)
+                score_f = pick_score_field(obj, expect_scores[0])
+                fee_f = pick_fee_field(obj)
+                if not key_f or not score_f:
+                    log(f"final-record: could not find key/score fields in {sorted(obj)}")
+                    result.update({"rows": 0, "fields": sorted(obj), "top3_ok": False})
+                    dump_json(CACHE / "final-record.json", result)
+                    return 1
+                extras = pick_side_qty(obj, {key_f, score_f, fee_f} - {None})
+                log(f"final-record: fields {sorted(obj)}; key {key_f}; score {score_f}; "
+                    f"fee {fee_f or 'none'}; side/qty {extras or 'none'}")
+                if ours_out and want is not None:
+                    ours_out.parent.mkdir(parents=True, exist_ok=True)
+                    csv_fh = ours_out.open("w", newline="", encoding="utf-8")
+                    cols = ["rank", "key", "score"] + (["fee"] if fee_f else []) + extras
+                    writer = csv.DictWriter(csv_fh, fieldnames=cols, extrasaction="ignore")
+                    writer.writeheader()
+            if rows_n <= 3:
+                top3.append({k: v for k, v in _row_view(obj, key_f, score_f, fee_f, extras, rows_n).items()
+                             if k != "key"})
+            if want is None:
+                if rows_n == 3:
+                    # The public check only needs the first three scores. Keep counting rows so the
+                    # report can say how long the record is; still one streaming pass.
+                    pass
+                if rows_n % 1000000 == 0:
+                    log(f"final-record: {rows_n} rows")
+                continue
+            did = obj.get(key_f)
+            if did not in want:
+                if rows_n % 1000000 == 0:
+                    log(f"final-record: {rows_n} rows")
+                continue
+            matched += 1
+            seen.add(did)
+            view = _row_view(obj, key_f, score_f, fee_f, extras, rows_n)
+            score = Decimal(view["score"])
+            sum_score += score
+            if score > 0:
+                n_pos += 1
+            elif score < 0:
+                n_neg += 1
+            else:
+                n_zero += 1
+            if fee_f and _is_num(view.get("fee")):
+                sum_fee += Decimal(view["fee"])
+            if best is None or score > best[0] or (score == best[0] and rows_n < best[1]):
+                best = (score, rows_n, view["score"], did)
+            if writer:
+                writer.writerow({k: view[k] for k in writer.fieldnames})
+            if rows_n % 1000000 == 0:
+                log(f"final-record: {rows_n} rows")
+    finally:
+        text.close()
+        if csv_fh:
+            csv_fh.close()
+    scores = [r.get("score") for r in top3]
+    top_ok = scores == list(expect_scores)
+    result.update({"rows": rows_n, "fields_key": key_f, "score_field": score_f, "fee_field": fee_f,
+                   "side_qty_fields": extras, "top3": top3, "top3_ok": top_ok,
+                   "expect_scores": list(expect_scores)})
+    dump_json(CACHE / "final-record.json", result)
+    shown = ", ".join(str(s) for s in scores)
+    if not top_ok:
+        log(f"final-record: top scores {shown} != {', '.join(expect_scores)}")
+        return 1
+    log(f"final-record: {rows_n} rows; top 3 {shown}")
+    if want is not None:
+        no_row = len(want - seen)
+        if best:
+            best_txt = f"best {best[2]} rank {best[1]} prefix {key_prefix(best[3])}"
+        else:
+            best_txt = "best none"
+        log(f"final-record: rows {matched} / keys {len(want)}; distinct keys {len(seen)}; "
+            f"keys with no row {no_row}; {best_txt}; sum scores {format(sum_score, 'f')}; "
+            f"sum fees {format(sum_fee, 'f')}; positive {n_pos}; negative {n_neg}; zero {n_zero}")
+        if ours_out:
+            log(f"final-record: wrote {ours_out}")
+    return 0
+
+
+def final_record_lines() -> list[str]:
+    """Markdown for the Final record section. Prefixes and scores only; no local DID tally."""
+    path = CACHE / "final-record.json"
+    lines = ["## Final record\n"]
+    if not path.exists():
+        lines.append("not checked (run the `final-record` stage).\n")
+        return lines
+    rec = json.loads(path.read_text())
+    got, exp = rec.get("sha256"), rec.get("expect_sha256") or FINAL_SHA256
+    if not rec.get("sha256_ok"):
+        lines.append(f"Decompressed bytes sha256 `{got}` (expected `{exp}`) **MISMATCH**.\n")
+        return lines
+    fee = rec.get("fee_field")
+    gzip_note = ""
+    if rec.get("gzip_sha256"):
+        gzip_note = f" Joined gzip sha256 `{rec['gzip_sha256']}`."
+    lines.append(
+        f"Official final record, streamed from `{FINAL_URL}` as `{FINAL_PART_NAMES[0]}`, "
+        f"`{FINAL_PART_NAMES[1]}` and `{FINAL_PART_NAMES[2]}`. Decompressed bytes sha256 `{got}` "
+        f"(matches `{exp}`).{gzip_note} Gzip JSON, {rec.get('rows')} rows. "
+        f"Score field `{rec.get('score_field')}`"
+        + (f", fee field `{fee}`." if fee else ".")
+        + "\n")
+    lines.append("First three rows. The score is the decimal text from the file, not a rounded float.\n")
+    lines.append("| # | key prefix | score | fee |")
+    lines.append("|---:|---|---:|---:|")
+    for row in rec.get("top3") or []:
+        lines.append(f"| {row['rank']} | `{row['prefix']}` | {row['score']} | {row.get('fee', '')} |")
+    lines.append("")
+    word = "match" if rec.get("top3_ok") else "DO NOT match"
+    exp_s = rec.get("expect_scores") or list(FINAL_TOP_SCORES)
+    shown = " / ".join(f"`{s}`" for s in exp_s)
+    lines.append(f"Top 3 scores {word} {shown}.\n")
+    return lines
+
+
 # ---------------------------------------------------------------- pipeline
 
 def cmd_all(args) -> int:
@@ -1160,7 +1928,7 @@ def cmd_all(args) -> int:
         common += ["--force"]
     refresh = ["--refresh"] if args.refresh else []
     steps = [[] if args.skip_fetch else ["fetch"], ["venue"] + refresh, ["indexsig"] + refresh,
-             ["nice", "verify"], ["nice", "replay"], ["report"]]
+             ["nice", "verify"], ["nice", "replay"], ["final-record"], ["report"]]
     for step in steps:
         if not step:
             continue
@@ -1179,18 +1947,26 @@ def cmd_all(args) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("stage", choices=["fetch", "venue", "indexsig", "verify", "replay", "report", "all"])
+    ap.add_argument("stage", choices=["fetch", "venue", "indexsig", "verify", "replay", "report",
+                                       "final-record", "all"])
     ap.add_argument("--repo", type=Path, default=DEFAULT_REPO, help="contest repo checkout (default ../close-call)")
     ap.add_argument("--referee", help="referee did:key (default: the venue's room-owners note for d-close1-pnl)")
     ap.add_argument("--asof", type=int, help="stop the replay at this sweep")
     ap.add_argument("--every", type=int, default=25, help="progress line every N records/sweeps")
-    ap.add_argument("--refresh", action="store_true", help="venue, indexsig: re-read the exports and notes")
+    ap.add_argument("--refresh", action="store_true",
+                    help="venue, indexsig, report: re-read the venue exports and notes")
     ap.add_argument("--skip-fetch", action="store_true", help="all: do not touch the archive")
     ap.add_argument("--force", action="store_true", help="verify/replay: redo even if the inputs are unchanged")
+    ap.add_argument("--parts-dir", type=Path, help="final-record: directory holding the three part files (no download)")
+    ap.add_argument("--expect-sha256", help="final-record: expected sha256 of the concatenated parts")
+    ap.add_argument("--expect-scores", help="final-record: three exact score strings, comma-separated")
+    ap.add_argument("--dids", type=Path, help="final-record: optional public did:key list to tally; not used by report")
+    ap.add_argument("--ours-out", type=Path, help="final-record: csv path for the --dids rows")
     args = ap.parse_args()
     args.repo = args.repo.expanduser().resolve()
     return {"fetch": cmd_fetch, "venue": cmd_venue, "indexsig": cmd_indexsig, "verify": cmd_verify,
-            "replay": cmd_replay, "report": cmd_report, "all": cmd_all}[args.stage](args)
+            "replay": cmd_replay, "report": cmd_report, "final-record": cmd_final_record,
+            "all": cmd_all}[args.stage](args)
 
 
 if __name__ == "__main__":
