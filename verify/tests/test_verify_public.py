@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import gzip
 import hashlib
 import json
 import shutil
@@ -255,6 +256,52 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("1 differ", text)
         self.assertEqual([l for l in text.splitlines() if l.startswith("index signature:")],
                          ["index signature: none published"])
+        self.assertIn("## Final standings", text)
+        self.assertIn("not yet available", text)
+        self.assertNotIn("| reproduced |", text)
+
+    def test_lock_and_settlement_meta(self):
+        self.assertEqual(self.ver["lock_sweep"], 2556)
+        self.assertEqual(self.ver["settlement_sweep"], 2568)
+        self.assertIsNone(self.ver["final_board"])
+        self.assertEqual(self.ver["final_price_time"], "2026-10-04T10:00:00Z")
+
+    def test_final_standings_replay_classifies(self):
+        """A settlement post at the as-of sweep: the hidden-trade key is not reproduced, the other is."""
+        ver_path = V.CACHE / "verify.json"
+        rep_path = V.CACHE / "replay.json"
+        saved_ver = ver_path.read_text()
+        saved_rep = rep_path.read_text() if rep_path.exists() else None
+        saved_force = self.args.force
+        try:
+            ver = json.loads(saved_ver)
+            board = ver["boards"][str(ver["asof"])]
+            ver["lock_sweep"] = ver["asof"]
+            ver["settlement_sweep"] = ver["asof"]
+            ver["final_board"] = {"n": ver["asof"], "mark": board["mark"], "top": board["top"]}
+            ver_path.write_text(json.dumps(ver))
+            self.args.force = True
+            self.assertEqual(V.cmd_replay(self.args), 0)
+            fs = json.loads(rep_path.read_text())["final_standings"]
+            self.assertTrue(fs["available"])
+            by = {r["key"]: r for r in fs["rows"]}
+            self.assertEqual(by[self.A]["status"], "consistent")
+            self.assertTrue(by[self.A]["reproducible"])
+            self.assertEqual(by[self.B]["status"], "off")
+            self.assertFalse(by[self.B]["reproducible"])
+            self.assertEqual(V.cmd_report(self.args), 0)
+            text = V.REPORT.read_text()
+            self.assertIn("## Final standings", text)
+            self.assertIn("| reproduced |", text)
+            self.assertIn("| not reproduced |", text)
+            self.assertNotIn("not yet available", text)
+        finally:
+            ver_path.write_text(saved_ver)
+            if saved_rep is None:
+                rep_path.unlink(missing_ok=True)
+            else:
+                rep_path.write_text(saved_rep)
+            self.args.force = saved_force
 
     def test_board_check_exact_at_unrounded_global(self):
         fold = V.load_fold(REPO).Fold()
@@ -415,6 +462,254 @@ class IndexSigTests(unittest.TestCase):
         self.run_check()
         (V.RECORDS / "index.json").write_bytes(self.index + b"\n")
         self.assertIn("not checked for the current index.json", V.index_sig_line())
+
+
+class FinalBoardTests(unittest.TestCase):
+    """Settlement sweep, which pnl post is the final board, and how the section classifies it."""
+
+    def test_settlement_sweep_is_one_hour_after_the_lock(self):
+        contest = json.loads((REPO / "contest.json").read_text())
+        self.assertEqual(contest["lock_sweep"], 2556)
+        self.assertEqual(contest["final_price_time"], "2026-10-04T10:00:00Z")
+        self.assertEqual(V.settlement_sweep(contest), 2568)
+        self.assertIsNone(V.settlement_sweep({}))
+
+    def test_selects_earliest_post_at_or_after_settlement(self):
+        earlier = {"mark": "1.00", "top": [["a", "1.00"]]}
+        at = {"mark": "2.00", "top": [["b", "2.00"]]}
+        later = {"mark": "3.00", "top": [["c", "3.00"]]}
+        self.assertEqual(V.select_final_board({2556: earlier, 2569: later, 2572: at}, 2568)["n"], 2569)
+        self.assertEqual(V.select_final_board({2568: at, 2570: later}, 2568)["n"], 2568)
+        self.assertIsNone(V.select_final_board({2556: earlier}, 2568))
+        self.assertIsNone(V.select_final_board({}, None))
+
+    def test_section_not_yet_available_without_a_post(self):
+        ver = {"asof": 2556, "lock_sweep": 2556, "settlement_sweep": 2568,
+               "lock_time": "2026-10-04T09:00:00Z", "final_price_time": "2026-10-04T10:00:00Z",
+               "final_board": None}
+        rep = {"final_standings": {"available": False, "asof": 2556, "lock_sweep": 2556,
+                                  "settlement_sweep": 2568, "rows": []}}
+        text = "\n".join(V.final_standings_lines(ver, rep))
+        self.assertIn("## Final standings", text)
+        self.assertIn("not yet available", text)
+        self.assertIn("sweep 2568", text)
+        self.assertNotIn("| reproduced |", text)
+        self.assertNotIn("| not reproduced |", text)
+
+    def test_section_classifies_exact_and_off(self):
+        A, B = (did_of(bytes([i]) * 32) for i in (2, 3))
+        fold = V.load_fold(REPO).Fold()
+        with localcontext() as ctx:
+            ctx.prec = 60
+            fold.seed("100.00")
+            fold.sweep(1, "100.00", "100.00", [A, B], [])
+            board = {"n": 1, "mark": "100.00", "top": [[A, "0.00"], [B, "1.00"]]}
+            ver = {"asof": 1, "lock_sweep": 1, "settlement_sweep": 1, "final_board": board,
+                   "lock_time": "2026-10-04T09:00:00Z", "final_price_time": "2026-10-04T10:00:00Z"}
+            fs = V.build_final_standings(fold, ver)
+        self.assertTrue(fs["available"])
+        rows = {r["key"]: r for r in fs["rows"]}
+        self.assertEqual(rows[A]["status"], "exact")
+        self.assertTrue(rows[A]["reproducible"])
+        self.assertEqual(rows[A]["posted"], "0.00")
+        self.assertEqual(rows[B]["status"], "off")
+        self.assertFalse(rows[B]["reproducible"])
+        text = "\n".join(V.final_standings_lines(ver, {"final_standings": fs}))
+        self.assertIn("## Final standings", text)
+        self.assertIn("| reproduced |", text)
+        self.assertIn("| not reproduced |", text)
+        self.assertNotIn("not yet available", text)
+        # before the lock, the same post is not the final board yet
+        ver["asof"] = 0
+        self.assertFalse(V.build_final_standings(fold, ver)["available"])
+
+    def test_standings_post_without_n_is_the_final_board(self):
+        """t=standings, with S and places and no n, is found and used. A post with n still is."""
+        seed = bytes([4]) * 32
+        referee = did_of(seed)
+        A = did_of(bytes([6]) * 32)
+        B = did_of(bytes([7]) * 32)
+        obj = {"t": "standings", "S": "234.69", "places": [[A, "1576.916300", [1], 1]],
+               "next": [[B, "1424.740300"]]}
+        self.assertNotIn("n", obj)
+        body = (export_line(3, seed, "d-close1-pnl", 11, obj) + "\n").encode()
+        posts, stats, problems = V.parse_export(body, "d-close1-pnl", referee)
+        self.assertEqual(problems, [])
+        self.assertEqual(stats["signature verified"], 1)
+        self.assertEqual(posts[0]["t"], "standings")
+        self.assertNotIn("n", posts[0])
+        self.assertEqual(posts[0]["S"], "234.69")
+        earlier = {"mark": "1.00", "top": [["a", "1.00"]]}
+        later = {"mark": "3.00", "top": [["c", "3.00"]]}
+        chosen = V.select_final_board({2556: earlier, 2569: later}, 2568, posts[0])
+        self.assertEqual(chosen["t"], "standings")
+        self.assertNotIn("n", chosen)
+        self.assertEqual(chosen["mark"], "234.69")
+        self.assertEqual(chosen["top"], [[A, "1576.916300"], [B, "1424.740300"]])
+        # a pnl post that still carries n is selected exactly as before when no standings post is passed
+        self.assertEqual(V.select_final_board({2556: earlier, 2569: later, 2572: {"mark": "2.00", "top": [["b", "2.00"]]}}, 2568)["n"], 2569)
+        kept = V.board_from_standings({"t": "standings", "n": 2568, "S": "5.00", "places": [[A, "1.00"]]})
+        self.assertEqual(kept["n"], 2568)
+        self.assertEqual(kept["mark"], "5.00")
+        self.assertEqual(V.select_final_board({2568: later}, 2568, {"t": "standings", "n": 2568, "S": "5.00", "places": [[A, "1.00"]]})["t"], "standings")
+
+        fold = V.load_fold(REPO).Fold()
+        with localcontext() as ctx:
+            ctx.prec = 60
+            fold.seed("100.00")
+            fold.sweep(1, "100.00", "100.00", [A], [])
+            six_dp = {"mark": "100.00", "top": [[A, "0.000000"]]}
+            checked, g_ok, _ = V.board_check(fold, six_dp)
+            self.assertTrue(g_ok)
+            self.assertEqual(checked[A][0], "exact")
+        board = V.board_from_standings({"t": "standings", "S": "100.00", "places": [[A, "0.00"]], "_ts": "2026-10-04T17:33:04Z"})
+        self.assertNotIn("n", board)
+        ver = {"asof": 2556, "lock_sweep": 2556, "settlement_sweep": 2568, "final_board": board,
+               "lock_time": "2026-10-04T09:00:00Z", "final_price_time": "2026-10-04T10:00:00Z"}
+        fs = V.build_final_standings(fold, ver)
+        self.assertTrue(fs["available"])
+        self.assertIsNone(fs["sweep"])
+        self.assertEqual(fs["source"], "standings")
+        self.assertEqual(fs["mark"], "100.00")
+        self.assertEqual(fs["rows"][0]["status"], "exact")
+        self.assertTrue(fs["rows"][0]["reproducible"])
+        text = "\n".join(V.final_standings_lines(ver, {"final_standings": fs}))
+        self.assertIn("## Final standings", text)
+        self.assertIn("t` = `standings", text)
+        self.assertIn("no sweep number", text)
+        self.assertIn("S `100.00`", text)
+        self.assertIn("| reproduced |", text)
+        self.assertNotIn("not yet available", text)
+
+
+class FinalRecordTests(unittest.TestCase):
+    """Tiny gzip parts. No network and no key directory."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="final-record-", dir=HERE))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self._saved = V.CACHE, V.PROGRESS, V.REPORT
+        V.CACHE = self.tmp / "cache"
+        V.CACHE.mkdir()
+        V.PROGRESS = self.tmp / "progress.log"
+        V.REPORT = self.tmp / "REPORT.md"
+
+    def tearDown(self):
+        V.CACHE, V.PROGRESS, V.REPORT = self._saved
+
+    def _did(self, n: int) -> str:
+        return "did:key:z6Mk" + f"{n:04d}" + ("A" * 40)
+
+    def _parts(self, body: bytes) -> tuple[Path, str]:
+        blob = gzip.compress(body)
+        cuts = [0, len(blob) // 3, 2 * len(blob) // 3, len(blob)]
+        directory = self.tmp / "parts"
+        directory.mkdir()
+        for i, name in enumerate(V.FINAL_PART_NAMES):
+            (directory / name).write_bytes(blob[cuts[i]:cuts[i + 1]])
+        return directory, hashlib.sha256(body).hexdigest()
+
+    def _record(self) -> bytes:
+        rows = [
+            '{"holder":"%s","pnl":9.50,"fees":1.25,"side":"buy","qty":"3"}' % self._did(1),
+            '{"holder":"%s","pnl":8.25,"fees":0.00,"side":"sell","qty":"1"}' % self._did(2),
+            '{"holder":"%s","pnl":1.00,"fees":-0.50,"side":"buy","qty":"2"}' % self._did(3),
+            '{"holder":"%s","pnl":-3.500,"fees":0.10,"side":"sell","qty":"4"}' % self._did(4),
+            '{"holder":"%s","pnl":0.000,"fees":0,"side":"buy","qty":"1"}' % self._did(1),
+        ]
+        return ("[" + ",".join(rows) + "]").encode()
+
+    def _args(self, directory: Path, digest: str, scores: str, dids: Path | None = None, out: Path | None = None):
+        return SimpleNamespace(parts_dir=directory, expect_sha256=digest, expect_scores=scores,
+                               dids=dids, ours_out=out)
+
+    def test_fixture_passes_and_report_has_exact_scores(self):
+        directory, digest = self._parts(self._record())
+        dids = self.tmp / "dids.txt"
+        dids.write_text("\n".join([self._did(1), self._did(4), self._did(9)]) + "\n")
+        out = self.tmp / "ours.csv"
+        code = V.cmd_final_record(self._args(directory, digest, "9.50,8.25,1.00", dids, out))
+        self.assertEqual(code, 0)
+        rec = json.loads((V.CACHE / "final-record.json").read_text())
+        self.assertTrue(rec["sha256_ok"])
+        self.assertTrue(rec["top3_ok"])
+        self.assertEqual([r["score"] for r in rec["top3"]], ["9.50", "8.25", "1.00"])
+        self.assertEqual(rec["score_field"], "pnl")
+        self.assertEqual(rec["fee_field"], "fees")
+        self.assertEqual(len(rec["top3"][0]["prefix"]), 12)
+        text = json.dumps(rec)
+        self.assertNotIn(self._did(1), text)
+        lines = "\n".join(V.final_record_lines())
+        self.assertIn("## Final record", lines)
+        self.assertIn("`9.50` / `8.25` / `1.00`", lines)
+        self.assertIn("matches", lines)
+        body = out.read_text()
+        self.assertIn(self._did(4), body)
+        self.assertNotIn(self._did(9), body)
+        self.assertEqual(body.count(self._did(1)), 2)
+
+    def test_bad_hash_stops(self):
+        directory = self.tmp / "parts"
+        directory.mkdir()
+        for name in V.FINAL_PART_NAMES:
+            (directory / name).write_bytes(b"not-gzip")
+        code = V.cmd_final_record(self._args(directory, "0" * 64, "9.50,8.25,1.00"))
+        self.assertEqual(code, 1)
+        rec = json.loads((V.CACHE / "final-record.json").read_text())
+        self.assertFalse(rec["sha256_ok"])
+        self.assertNotIn("top3", rec)
+        self.assertNotEqual(rec["sha256"], "0" * 64)
+
+    def test_wrong_top_score_fails(self):
+        directory, digest = self._parts(self._record())
+        code = V.cmd_final_record(self._args(directory, digest, "9.51,8.25,1.00"))
+        self.assertEqual(code, 1)
+        rec = json.loads((V.CACHE / "final-record.json").read_text())
+        self.assertTrue(rec["sha256_ok"])
+        self.assertFalse(rec["top3_ok"])
+        self.assertEqual(rec["top3"][0]["score"], "9.50")
+
+    def test_wrapped_standings_array(self):
+        body = b'{"output":{"standings":' + self._record() + b'}}'
+        directory, digest = self._parts(body)
+        code = V.cmd_final_record(self._args(directory, digest, "9.50,8.25,1.00"))
+        self.assertEqual(code, 0)
+        rec = json.loads((V.CACHE / "final-record.json").read_text())
+        self.assertEqual(rec["sha256_of"], "decompressed")
+        self.assertEqual(rec["rows"], 5)
+        self.assertEqual([r["score"] for r in rec["top3"]], ["9.50", "8.25", "1.00"])
+
+    def test_verified_record_is_the_final_board(self):
+        rec = {
+            "sha256": V.FINAL_SHA256, "sha256_ok": True, "top3_ok": True,
+            "top3": [
+                {"rank": 1, "prefix": "z6MksSsc4ny8", "score": "1576.916300", "fee": "2220.9839", "places": [1]},
+                {"rank": 2, "prefix": "z6MksT96nB2c", "score": "1424.740300", "fee": "2515.8249", "places": [2]},
+                {"rank": 3, "prefix": "z6MksPKMgp8P", "score": "1337.545600", "fee": "1649.2162", "places": [3]},
+            ],
+        }
+        ver = {"asof": 2556, "lock_sweep": 2556, "settlement_sweep": 2568,
+               "lock_time": "2026-10-04T09:00:00Z", "final_price_time": "2026-10-04T10:00:00Z",
+               "final_board": None}
+        rep = {"final_standings": {"available": False, "asof": 2556, "lock_sweep": 2556,
+                                  "settlement_sweep": 2568, "rows": []}}
+        text = "\n".join(V.final_standings_lines(ver, rep, None, rec))
+        self.assertIn("## Final standings", text)
+        self.assertIn("`d-close1-pnl` #2557", text)
+        self.assertIn("2026-10-04T17:33:04Z", text)
+        self.assertIn("1576.916300", text)
+        self.assertIn("1424.740300", text)
+        self.assertIn("1337.545600", text)
+        self.assertIn("| 1 | `z6MksSsc4ny8` | 1576.916300 | 1 | 2220.9839 |", text)
+        self.assertNotIn("not yet available", text)
+        bad = {"sha256": "0" * 64, "sha256_ok": False, "top3_ok": False, "top3": []}
+        missed = "\n".join(V.final_standings_lines(ver, rep, None, bad))
+        self.assertIn("not yet available", missed)
+
+    def test_section_not_checked_without_a_result(self):
+        text = "\n".join(V.final_record_lines())
+        self.assertIn("not checked", text)
+        self.assertNotIn("MISMATCH", text)
 
 
 if __name__ == "__main__":
