@@ -1,0 +1,17 @@
+day: 2026-10-06
+status: complete
+messages: 2164450
+final_kind_original: 398739 (18.42%)
+final_kind_template: 844759 (39.03%)
+final_kind_spam: 993 (0.05%)
+final_kind_nonsense: 4490 (0.21%)
+final_kind_filler: 915469 (42.30%)
+identities: 1121879
+ever_original: 300896 (26.82%)
+original_2plus: 23046 (2.05%)
+resume_api_calls: 86884
+resume_input_tokens: 44283361
+resume_cost_usd: 1.859901
+prior_run_cost_usd: 25.631176
+resume_failures: 0
+model: jev-1.13.0

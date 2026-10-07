@@ -1,0 +1,34 @@
+selfdeal source: ~/Desktop/RV/selfdeal.py queries on a db_snapshot of ~/.tc-archive.sqlite
+labels: complete day; every message has a final_kind
+day_rows: 2164450
+empty_final_kind: 0
+
+--- selfdeal.py ---
+accepts with a matching offer: 10470652 of 10546968
+payer == payee: 1195
+top payer->payee pairs (deals each): [29217, 22855, 18246, 12893, 11917]
+identities on both sides: 105812
+completed deals: 42979; self-deals: 77
+top completing pairs (deals each): [73, 58, 40, 38, 33]
+distinct pairs among completed: 30547
+
+--- distinct selfdeal dids ---
+payers: 156936
+payees: 243061
+either: 294185
+
+--- appear in the lobby day ---
+payers_in_lobby: 8658
+payees_in_lobby: 8606
+either_in_lobby: 13458
+
+--- final_kind original among selfdeal dids in the lobby ---
+payers_ever_original: 6682
+payers_original_2plus: 2817
+payees_ever_original: 6725
+payees_original_2plus: 2868
+either_ever_original: 10849
+either_original_2plus: 4913
+
+--- lobby identities with ever_original that appear in selfdeal ---
+ever_original_in_selfdeal: 10849
