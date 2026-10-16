@@ -1,0 +1,12 @@
+window: 2026-08-27T00:00:00Z through 2026-10-13T00:57:28.117985Z (last hour 2026-10-13T00:00:00Z).
+freeze rowid: 114505988.
+archive start: 2026-08-28T10:29:41.808194Z.
+total distinct did:keys whose first-seen hour falls inside the window: 20523034.
+peak hour: 2026-09-06T09:00:00Z count=131688.
+last hour count: 2026-10-13T00:00:00Z count=5104.
+median hourly first-seen count: 12850.
+median rule: n=1095 is odd. Median is the middle value after sorting ascending, at 1-based position 548. Central values: 12850 and 12850.
+coverage: 1095 hours have at least one archived message; 34 hours have none.
+gap estimate: 34 × 12850 = 436900. This is an estimate (missing hours × median), not a measured count, and it is not added to the total.
+first-seen hours outside the fixed window: 0.
+source: read-only query of a read-only APFS clone of the live archive. The live database was not queried.
